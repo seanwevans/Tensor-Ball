@@ -6,9 +6,9 @@ const CONFIG = {
   // Balls simulated + trained on per batch. Each ball costs two stereo render
   // passes plus two synchronous readRenderTargetPixels() readbacks every batch
   // reset, so this is the dominant cost driver. 2048 stalls the tab for
-  // seconds per batch; 256 keeps the vision capture responsive while still
-  // giving the critic a healthy batch to fit.
-  batchSize: 256,
+  // seconds per batch; 512 keeps the vision capture responsive while still
+  // giving the critic a large batch to fit.
+  batchSize: 512,
   visionWidth: 64,
   visionHeight: 64,
   ballRadius: 0.4,
