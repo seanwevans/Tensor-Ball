@@ -863,7 +863,8 @@ class Dashboard {
       if (d.train > maxLoss) maxLoss = d.train;
     });
     maxLoss = Math.max(maxLoss, 10.0);
-    const mapX = (i) => (i / (this.lossHistory.length - 1)) * w;
+    const denom = Math.max(1, this.lossHistory.length - 1);
+    const mapX = (i) => (i / denom) * w;
     const mapY = (val) => h - (val / maxLoss) * h;
 
     this.lossCtx.beginPath();
