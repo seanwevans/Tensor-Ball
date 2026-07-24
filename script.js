@@ -3,7 +3,7 @@ import { OrbitControls } from "https://esm.sh/three@0.132.2/examples/jsm/control
 import * as CANNON from "https://esm.sh/cannon-es@0.19.0";
 
 const CONFIG = {
-  batchSize: 2048,
+  batchSize: 32,
   visionWidth: 64,
   visionHeight: 64,
   ballRadius: 0.4,
