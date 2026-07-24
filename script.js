@@ -1122,12 +1122,19 @@ class TrainingArena {
       const isStopped = b.body.velocity.length() < 0.2;
       const isOOB =
         Math.abs(b.body.position.x) > 50 || Math.abs(b.body.position.z) > 30;
-      const isFallen = b.body.position.y < -2;
+      // Terminate the moment the ball reaches floor level. It rests at
+      // y == ballRadius on the (infinite) floor plane and every shot launches
+      // from y >= 4.5, so this only fires once a shot has come back down —
+      // culling missed shots on first floor contact instead of letting them
+      // bounce and roll to a stop. Made shots still end via b.scored at the
+      // hoop, well above the floor. (Replaces the old y < -2 check, which the
+      // infinite floor plane made unreachable.)
+      const isOnFloor = b.body.position.y < CONFIG.ballRadius + 0.15;
       const isTimeout = b.path.length > 600;
 
       if (
         b.scored ||
-        isFallen ||
+        isOnFloor ||
         isOOB ||
         (isStopped && b.path.length > 10) ||
         isTimeout
