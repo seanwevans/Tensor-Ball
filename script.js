@@ -206,6 +206,13 @@ class CNNAgent {
   _buildActor() {
     const m = tf.sequential();
     this._convBase(m);
+    // The critic owns the shared conv backbone: train() copies the critic's
+    // conv weights into the actor after every batch. Freeze the actor's two
+    // conv layers so actor.fit() doesn't waste work computing gradients that
+    // get overwritten, and so the actor's dense head trains against a stable
+    // feature extractor.
+    m.layers[0].trainable = false;
+    m.layers[1].trainable = false;
     m.add(
       tf.layers.dense({
         units: 3,
