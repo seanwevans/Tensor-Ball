@@ -241,12 +241,16 @@ class CNNAgent {
         2
       ]);
       const data = this.actor.predict(stateTensor).dataSync(); // batchSize * 3
+      // Clamp to [-1, 1] after adding exploration noise: the actor's output
+      // is tanh-bounded, and these actions are later stored as regression
+      // targets, so out-of-range values would be unreachable training goals.
+      const clamp = (v) => Math.max(-1, Math.min(1, v));
       const actions = [];
       for (let i = 0; i < this.batchSize; i++) {
         actions.push([
-          data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale,
-          data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale,
-          data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale
+          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale),
+          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale),
+          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale)
         ]);
       }
       return actions;
