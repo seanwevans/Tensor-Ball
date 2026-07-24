@@ -3,7 +3,12 @@ import { OrbitControls } from "https://esm.sh/three@0.132.2/examples/jsm/control
 import * as CANNON from "https://esm.sh/cannon-es@0.19.0";
 
 const CONFIG = {
-  batchSize: 2048,
+  // Balls simulated + trained on per batch. Each ball costs two stereo render
+  // passes plus two synchronous readRenderTargetPixels() readbacks every batch
+  // reset, so this is the dominant cost driver. 2048 stalls the tab for
+  // seconds per batch; 256 keeps the vision capture responsive while still
+  // giving the critic a healthy batch to fit.
+  batchSize: 256,
   visionWidth: 64,
   visionHeight: 64,
   ballRadius: 0.4,
