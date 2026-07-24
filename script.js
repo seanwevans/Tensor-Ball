@@ -412,7 +412,11 @@ class PhysicsWorld {
   constructor() {
     this.world = new CANNON.World();
     this.world.gravity.set(0, -32.2, 0);
-    this.world.broadphase = new CANNON.NaiveBroadphase();
+    // SAPBroadphase (sweep-and-prune) instead of NaiveBroadphase: with
+    // CONFIG.batchSize balls in the world, naive O(n^2) pair enumeration
+    // dominates each step. Balls never collide with each other (their mask
+    // is court-only), so sweep-and-prune's sorted-axis pruning is a pure win.
+    this.world.broadphase = new CANNON.SAPBroadphase(this.world);
     this.world.solver.iterations = 10;
 
     this.concrete = new CANNON.Material("concrete");
