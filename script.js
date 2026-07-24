@@ -8,7 +8,7 @@ const CONFIG = {
   // reset, so this is the dominant cost driver. 2048 stalls the tab for
   // seconds per batch; 512 keeps the vision capture responsive while still
   // giving the critic a large batch to fit.
-  batchSize: 1024,
+  batchSize: 2048,
   visionWidth: 64,
   visionHeight: 64,
   ballRadius: 0.4,
