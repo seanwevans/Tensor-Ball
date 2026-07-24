@@ -311,6 +311,17 @@ class CNNAgent {
     for (let i = 0; i < batchSize; i++)
       if (advantageData[i] > 0) goodIndices.push(i);
 
+    // Sync the shared conv layers (critic -> actor) BEFORE fitting the actor.
+    // The actor's conv layers are frozen, so actor.fit() only adjusts its dense
+    // head — and that head should be trained against the same features the
+    // actor will use at inference. Syncing after the fit would instead train
+    // the head on the previous batch's stale features, then swap the backbone
+    // out from under it.
+    tf.tidy(() => {
+      for (let i = 0; i < 2; i++)
+        this.actor.layers[i].setWeights(this.critic.layers[i].getWeights());
+    });
+
     if (goodIndices.length > 0) {
       const idx = tf.tensor1d(goodIndices, "int32");
       const goodStateTensor = tf.gather(stateTensor, idx);
@@ -323,12 +334,6 @@ class CNNAgent {
       goodStateTensor.dispose();
       goodActionTensor.dispose();
     }
-
-    // Sync the shared conv layers (critic -> actor).
-    tf.tidy(() => {
-      for (let i = 0; i < 2; i++)
-        this.actor.layers[i].setWeights(this.critic.layers[i].getWeights());
-    });
 
     stateTensor.dispose();
     actionTensor.dispose();
