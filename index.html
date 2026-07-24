@@ -1,36 +1,55 @@
-<link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.17.0/dist/tf-backend-webgpu.min.js"></script>
-<script type="module" src="script.js"></script>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tensor Ball — Basketball Reinforcement Learning Environment</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.17.0/dist/tf-backend-webgpu.min.js"></script>
+  <script type="module" src="script.js"></script>
+</head>
+<body>
+  <div id="info">Basketball Reinforced Learning Environment v7.0</div>
 
-<div id="info">Basketball Reinforced Learning Environment v7.0</div>
-
-<div id="agent-monitor">
-  <h3 style="margin-top:0; border-bottom:1px solid #555; padding-bottom:5px;">Last Agent Decision</h3>
-  <div class="stat-row"><span>Vert Pwr:</span> <span id="ag-fy">--</span></div>
-  <div class="stat-row"><span>Fwd Pwr:</span> <span id="ag-fx">--</span></div>
-  <div class="stat-row"><span>Aim Adj:</span> <span id="ag-fz">--</span></div>
-  <div class="stat-row"><span>Result:</span> <span id="ag-result">--</span></div>
-  <div class="stat-row"><span>Reward:</span> <span id="ag-reward">--</span></div>
-</div>
-
-<div id="vision-container">
-  <h3>Stereo Vision (Sample)</h3>
-  <canvas id="agent-view-canvas" width="128" height="64"></canvas>
-  <h3>Learned Filters (L1)</h3>
-  <canvas id="kernel-canvas" width="256" height="32"></canvas>
-  <h3>Network Activity (Dense)</h3>
-  <canvas id="act-canvas" width="230" height="100"></canvas>
-</div>
-
-<div id="graph-container">
-  <h3>Batch Loss (Critic)</h3>
-  <canvas id="loss-canvas" width="230" height="100"></canvas>
-  <div class="legend">
-    <span class="leg-train">■ Batch Loss</span>
+  <div id="agent-monitor">
+    <h3 style="margin-top:0; border-bottom:1px solid #555; padding-bottom:5px;">Last Agent Decision</h3>
+    <div class="stat-row"><span>Vert Pwr:</span> <span id="ag-fy">--</span></div>
+    <div class="stat-row"><span>Fwd Pwr:</span> <span id="ag-fx">--</span></div>
+    <div class="stat-row"><span>Aim Adj:</span> <span id="ag-fz">--</span></div>
+    <div class="stat-row"><span>Result:</span> <span id="ag-result">--</span></div>
+    <div class="stat-row"><span>Reward:</span> <span id="ag-reward">--</span></div>
   </div>
-  <div id="tf-backend-status">Initializing TF...</div>
-</div>
+
+  <div id="vision-container">
+    <h3>Stereo Vision (Sample)</h3>
+    <canvas id="agent-view-canvas" width="128" height="64"></canvas>
+    <h3>Learned Filters (L1)</h3>
+    <canvas id="kernel-canvas" width="256" height="32"></canvas>
+    <h3>Network Activity (Dense)</h3>
+    <canvas id="act-canvas" width="230" height="100"></canvas>
+  </div>
+
+  <div id="graph-container">
+    <h3>Batch Loss (Critic)</h3>
+    <canvas id="loss-canvas" width="230" height="100"></canvas>
+    <div class="legend">
+      <span class="leg-train">■ Batch Loss</span>
+    </div>
+    <div id="tf-backend-status">Initializing TF...</div>
+  </div>
+
+  <div id="training-ui">
+    <h3 style="margin-top:0">Training Stats</h3>
+    <div class="stat-row"><span>Episode:</span> <span id="ep-count">0</span></div>
+    <div class="stat-row"><span>Last Reward:</span> <span id="last-reward">0.00</span></div>
+    <div class="stat-row"><span>Baskets:</span> <span id="baskets">0</span></div>
+    <div class="stat-row"><span>Accuracy:</span> <span id="accuracy">0%</span></div>
+    <div class="stat-row"><span>Status:</span> <span id="status">Manual Mode</span></div>
+    <div class="stat-row"><span>Batch:</span> <span id="batch-progress">0/32</span></div>
+    <button id="toggle-train">START TRAINING</button>
+    <button id="export-btn" style="background: #333; margin-top: 5px; border: 1px solid #555;">EXPORT POLICY</button>
+  </div>
 
 <div id="training-ui">
   <h3 style="margin-top:0">Training Stats</h3>
@@ -45,3 +64,8 @@
   <button id="turbo-btn" style="background: #333; margin-top: 5px; border: 1px solid #555;">TURBO MODE</button>
   <button id="export-btn" style="background: #333; margin-top: 5px; border: 1px solid #555;">EXPORT POLICY</button>
 </div>
+  <div id="instructions">
+    Left-Drag Ball: Aim &amp; Shoot &nbsp;|&nbsp; Right-Drag Ball: Reposition &nbsp;|&nbsp; Drag Background: Orbit Camera &nbsp;|&nbsp; Space: Reset
+  </div>
+</body>
+</html>

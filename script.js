@@ -218,6 +218,13 @@ class CNNAgent {
   _buildActor() {
     const m = tf.sequential();
     this._convBase(m);
+    // The critic owns the shared conv backbone: train() copies the critic's
+    // conv weights into the actor after every batch. Freeze the actor's two
+    // conv layers so actor.fit() doesn't waste work computing gradients that
+    // get overwritten, and so the actor's dense head trains against a stable
+    // feature extractor.
+    m.layers[0].trainable = false;
+    m.layers[1].trainable = false;
     m.add(
       tf.layers.dense({
         units: 3,
@@ -253,12 +260,16 @@ class CNNAgent {
         2
       ]);
       const data = this.actor.predict(stateTensor).dataSync(); // batchSize * 3
+      // Clamp to [-1, 1] after adding exploration noise: the actor's output
+      // is tanh-bounded, and these actions are later stored as regression
+      // targets, so out-of-range values would be unreachable training goals.
+      const clamp = (v) => Math.max(-1, Math.min(1, v));
       const actions = [];
       for (let i = 0; i < this.batchSize; i++) {
         actions.push([
-          data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale,
-          data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale,
-          data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale
+          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale),
+          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale),
+          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale)
         ]);
       }
       return actions;
@@ -880,7 +891,8 @@ class Dashboard {
       if (d.train > maxLoss) maxLoss = d.train;
     });
     maxLoss = Math.max(maxLoss, 10.0);
-    const mapX = (i) => (i / (this.lossHistory.length - 1)) * w;
+    const denom = Math.max(1, this.lossHistory.length - 1);
+    const mapX = (i) => (i / denom) * w;
     const mapY = (val) => h - (val / maxLoss) * h;
 
     this.lossCtx.beginPath();
