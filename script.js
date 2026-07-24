@@ -16,16 +16,13 @@ const CONFIG = {
   groups: { court: 1, ball: 2 },
   rim: { x: 41.75, y: 10, z: 0 },
 
-  // "Turbo" throughput presets, selected at runtime from the active TF
-  // backend. The goal is maximum training iterations/sec: fast-forward the
-  // physics (simSteps per animation frame shortens each episode in wall
-  // time), draw the main scene only every Nth frame, and skip the per-batch
-  // dashboard visualizations. A GPU backend (webgpu/webgl) trains fast, so we
-  // push the sim harder and render less; a CPU backend spends most of the
-  // frame inside tf, so we fast-forward more gently to stay responsive.
+  // Turbo keeps the scene rendering and all visualizations on; it only
+  // fast-forwards physics by running extra sim ticks within a per-frame time
+  // budget (ms). At least one tick always runs and the loop stops at the
+  // budget, so Turbo is never slower or jankier than normal mode.
   turbo: {
-    gpu: { label: "GPU", simSteps: 16, renderEveryNFrames: 4 },
-    cpu: { label: "CPU", simSteps: 6, renderEveryNFrames: 8 }
+    gpu: { label: "GPU", frameBudgetMs: 20 },
+    cpu: { label: "CPU", frameBudgetMs: 12 }
   }
 };
 
@@ -1081,9 +1078,6 @@ class TrainingArena {
     this.episodeStats = { count: 0, baskets: 0, shots: 0 };
     this.accuracyHistory = [];
     this.isTrainingStep = false;
-    // When false (Turbo mode), the expensive per-batch dashboard drawing is
-    // skipped so more of each frame goes to physics + training.
-    this.visualize = true;
   }
 
   // Position all balls but don't launch (initial state / warm-up).
@@ -1111,13 +1105,11 @@ class TrainingArena {
       b.launch(actions[i], this.hoopPos);
     }
 
-    if (this.visualize) {
-      this.dashboard.visualizeActivations(
-        this.agent.getActivations(this.balls[0].startPixels)
-      );
-      this.dashboard.visualizeKernels(this.agent);
-      this.dashboard.drawAgentView(batch);
-    }
+    this.dashboard.visualizeActivations(
+      this.agent.getActivations(this.balls[0].startPixels)
+    );
+    this.dashboard.visualizeKernels(this.agent);
+    this.dashboard.drawAgentView(batch);
   }
 
   // Per-frame update; returns the number of finished (inactive) balls.
@@ -1448,13 +1440,8 @@ class App {
     this.arena = null;
     this.trainingMode = false;
 
-    // Turbo (max-throughput) mode. Preset is chosen from the TF backend in
-    // start(); until then it is disabled and falls back to the CPU preset.
     this.turboMode = false;
     this.turboPreset = CONFIG.turbo.cpu;
-    this.frameCount = 0;
-
-    // Throughput metering (shots/sec, averaged over ~500 ms windows).
     this.meterLastTime = 0;
     this.meterLastShots = 0;
 
@@ -1511,15 +1498,11 @@ class App {
     if (btnTurbo) {
       btnTurbo.addEventListener("click", () => {
         this.turboMode = !this.turboMode;
-        if (this.arena) this.arena.visualize = !this.turboMode;
-        // Reset the throughput window so the first reading isn't skewed.
         this.meterLastTime = performance.now();
         this.meterLastShots = this.arena ? this.arena.episodeStats.shots : 0;
-
-        // Inline background beats the stylesheet's .active rule, so set it here.
         btnTurbo.style.background = this.turboMode ? "#cc3300" : "#333";
         btnTurbo.innerText = this.turboMode
-          ? `TURBO: ${this.turboPreset.label} ×${this.turboPreset.simSteps}`
+          ? `TURBO: ${this.turboPreset.label}`
           : "TURBO MODE";
         if (!this.turboMode) this.dashboard.setThroughput("--");
       });
@@ -1575,8 +1558,8 @@ class App {
   // Returns true when a batch just kicked off training, so the caller stops
   // fast-forwarding until that async work resolves.
   _simStep() {
+    if (this.arena && this.arena.isTrainingStep) return true;
     this.physics.step();
-    this.manual.update();
 
     if (!this.arena) return false;
     const finished = this.arena.update();
@@ -1585,15 +1568,11 @@ class App {
         this.arena.finishBatch(this.manual.mesh);
         return true;
       }
-      if (!this.turboMode)
-        this.dashboard.setBatchProgress(
-          `${CONFIG.batchSize - finished} Active`
-        );
+      this.dashboard.setBatchProgress(`${CONFIG.batchSize - finished} Active`);
     }
     return false;
   }
 
-  // Refresh the shots/sec readout about twice a second while in Turbo mode.
   _meterThroughput(now) {
     if (!this.turboMode || !this.arena) return;
     const dt = now - this.meterLastTime;
@@ -1608,23 +1587,15 @@ class App {
   _loop() {
     requestAnimationFrame(() => this._loop());
 
-    // Turbo fast-forwards the physics by running several sim ticks per frame,
-    // shortening each episode in wall time and multiplying batches/sec.
-    const steps = this.turboMode ? this.turboPreset.simSteps : 1;
-    for (let s = 0; s < steps; s++) {
-      if (this.arena && this.arena.isTrainingStep) break;
+    const budgetMs = this.turboMode ? this.turboPreset.frameBudgetMs : 0;
+    const start = performance.now();
+    do {
       if (this._simStep()) break;
-    }
+    } while (this.turboMode && performance.now() - start < budgetMs);
 
     this._meterThroughput(performance.now());
-
-    // In Turbo mode the 3D scene is drawn only every Nth frame so the saved
-    // render time is spent on physics + training instead.
-    this.frameCount++;
-    const renderEvery = this.turboMode
-      ? this.turboPreset.renderEveryNFrames
-      : 1;
-    if (this.frameCount % renderEvery === 0) this.sceneMgr.render();
+    this.manual.update();
+    this.sceneMgr.render();
   }
 }
 
