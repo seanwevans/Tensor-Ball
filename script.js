@@ -358,10 +358,7 @@ class SceneManager {
     );
     this.camera.position.set(0, 10, 0);
 
-    this.renderer = new THREE.WebGLRenderer({
-      antialias: true,
-      preserveDrawingBuffer: true
-    });
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
