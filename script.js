@@ -15,15 +15,6 @@ const CONFIG = {
   ipd: 0.2, // stereo interpupillary distance
   groups: { court: 1, ball: 2 },
   rim: { x: 41.75, y: 10, z: 0 },
-
-  // "Turbo" throughput presets, selected at runtime from the active TF
-  // backend. Turbo keeps the scene rendering every frame and all
-  // visualizations on -- it only fast-forwards the physics by running extra
-  // sim ticks within a per-frame time budget (in ms). Because at least one
-  // tick always runs and the loop stops once the budget is spent, Turbo can
-  // never be slower or jankier than normal mode; on capable hardware it packs
-  // many ticks per frame, so episodes finish sooner and batches/sec climbs.
-  // A GPU backend trains fast, so it gets a larger budget than the cpu one.
   turbo: {
     gpu: { label: "GPU", frameBudgetMs: 20 },
     cpu: { label: "CPU", frameBudgetMs: 12 }
@@ -219,6 +210,13 @@ class CNNAgent {
   _buildActor() {
     const m = tf.sequential();
     this._convBase(m);
+    // The critic owns the shared conv backbone: train() copies the critic's
+    // conv weights into the actor after every batch. Freeze the actor's two
+    // conv layers so actor.fit() doesn't waste work computing gradients that
+    // get overwritten, and so the actor's dense head trains against a stable
+    // feature extractor.
+    m.layers[0].trainable = false;
+    m.layers[1].trainable = false;
     m.add(
       tf.layers.dense({
         units: 3,
@@ -254,12 +252,16 @@ class CNNAgent {
         2
       ]);
       const data = this.actor.predict(stateTensor).dataSync(); // batchSize * 3
+      // Clamp to [-1, 1] after adding exploration noise: the actor's output
+      // is tanh-bounded, and these actions are later stored as regression
+      // targets, so out-of-range values would be unreachable training goals.
+      const clamp = (v) => Math.max(-1, Math.min(1, v));
       const actions = [];
       for (let i = 0; i < this.batchSize; i++) {
         actions.push([
-          data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale,
-          data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale,
-          data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale
+          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale),
+          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale),
+          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale)
         ]);
       }
       return actions;
@@ -462,6 +464,7 @@ class Court {
     this.rimBody = null;
     this.backboardBody = null;
     this.scoringSensor = null;
+    this.floorBody = null;
 
     this._buildFloor();
 
@@ -492,6 +495,7 @@ class Court {
     body.collisionFilterGroup = CONFIG.groups.court;
     body.collisionFilterMask = CONFIG.groups.ball | CONFIG.groups.court;
     this.physics.add(body);
+    this.floorBody = body;
   }
 
   _line(w, h, x, z) {
@@ -621,6 +625,7 @@ class Ball {
     this.scored = false;
     this.hitBackboard = false;
     this.hitRim = false;
+    this.floorBounces = 0;
   }
 
   // Position at a random launch spot and mark active/visible.
@@ -675,6 +680,7 @@ class Ball {
       this.scored = true;
     else if (other === court.backboardBody) this.hitBackboard = true;
     else if (other === court.rimBody) this.hitRim = true;
+    else if (other === court.floorBody) this.floorBounces++;
   }
 }
 
@@ -881,7 +887,8 @@ class Dashboard {
       if (d.train > maxLoss) maxLoss = d.train;
     });
     maxLoss = Math.max(maxLoss, 10.0);
-    const mapX = (i) => (i / (this.lossHistory.length - 1)) * w;
+    const denom = Math.max(1, this.lossHistory.length - 1);
+    const mapX = (i) => (i / denom) * w;
     const mapY = (val) => h - (val / maxLoss) * h;
 
     this.lossCtx.beginPath();
@@ -1119,11 +1126,13 @@ class TrainingArena {
         Math.abs(b.body.position.x) > 50 || Math.abs(b.body.position.z) > 30;
       const isFallen = b.body.position.y < -2;
       const isTimeout = b.path.length > 600;
+      const isBounced = b.floorBounces >= 2;
 
       if (
         b.scored ||
         isFallen ||
         isOOB ||
+        isBounced ||
         (isStopped && b.path.length > 10) ||
         isTimeout
       ) {
@@ -1426,12 +1435,8 @@ class App {
     this.arena = null;
     this.trainingMode = false;
 
-    // Turbo (max-throughput) mode. Preset is chosen from the TF backend in
-    // start(); until then it is disabled and falls back to the CPU preset.
     this.turboMode = false;
     this.turboPreset = CONFIG.turbo.cpu;
-
-    // Throughput metering (shots/sec, averaged over ~500 ms windows).
     this.meterLastTime = 0;
     this.meterLastShots = 0;
 
@@ -1488,11 +1493,8 @@ class App {
     if (btnTurbo) {
       btnTurbo.addEventListener("click", () => {
         this.turboMode = !this.turboMode;
-        // Reset the throughput window so the first reading isn't skewed.
         this.meterLastTime = performance.now();
         this.meterLastShots = this.arena ? this.arena.episodeStats.shots : 0;
-
-        // Inline background beats the stylesheet's .active rule, so set it here.
         btnTurbo.style.background = this.turboMode ? "#cc3300" : "#333";
         btnTurbo.innerText = this.turboMode
           ? `TURBO: ${this.turboPreset.label}`
@@ -1569,7 +1571,6 @@ class App {
     return false;
   }
 
-  // Refresh the shots/sec readout about twice a second while in Turbo mode.
   _meterThroughput(now) {
     if (!this.turboMode || !this.arena) return;
     const dt = now - this.meterLastTime;
@@ -1583,12 +1584,6 @@ class App {
 
   _loop() {
     requestAnimationFrame(() => this._loop());
-
-    // The scene is rendered every frame and every visualization stays on.
-    // Turbo only fast-forwards the physics: it keeps running sim ticks within
-    // a per-frame time budget, so episodes finish in fewer wall-clock frames
-    // and batches/sec climbs -- while the process stays fully visible. Outside
-    // Turbo the budget is 0, so the loop runs exactly one tick per frame.
     const budgetMs = this.turboMode ? this.turboPreset.frameBudgetMs : 0;
     const start = performance.now();
     do {
