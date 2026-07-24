@@ -449,6 +449,7 @@ class Court {
     this.rimBody = null;
     this.backboardBody = null;
     this.scoringSensor = null;
+    this.floorBody = null;
 
     this._buildFloor();
 
@@ -479,6 +480,7 @@ class Court {
     body.collisionFilterGroup = CONFIG.groups.court;
     body.collisionFilterMask = CONFIG.groups.ball | CONFIG.groups.court;
     this.physics.add(body);
+    this.floorBody = body;
   }
 
   _line(w, h, x, z) {
@@ -608,6 +610,7 @@ class Ball {
     this.scored = false;
     this.hitBackboard = false;
     this.hitRim = false;
+    this.floorBounces = 0;
   }
 
   // Position at a random launch spot and mark active/visible.
@@ -662,6 +665,7 @@ class Ball {
       this.scored = true;
     else if (other === court.backboardBody) this.hitBackboard = true;
     else if (other === court.rimBody) this.hitRim = true;
+    else if (other === court.floorBody) this.floorBounces++;
   }
 }
 
@@ -1101,11 +1105,13 @@ class TrainingArena {
         Math.abs(b.body.position.x) > 50 || Math.abs(b.body.position.z) > 30;
       const isFallen = b.body.position.y < -2;
       const isTimeout = b.path.length > 600;
+      const isBounced = b.floorBounces >= 2;
 
       if (
         b.scored ||
         isFallen ||
         isOOB ||
+        isBounced ||
         (isStopped && b.path.length > 10) ||
         isTimeout
       ) {
