@@ -170,6 +170,12 @@ class CNNAgent {
     this.learningRate = learningRate;
     this.batchSize = batchSize;
     this.l2Reg = tf.regularizers.l2({ l2 });
+    // Input geometry, derived from CONFIG so the network and all tensor
+    // reshapes track the vision resolution. Channels is 2 (stereo L/R).
+    this.visionW = CONFIG.visionWidth;
+    this.visionH = CONFIG.visionHeight;
+    this.channels = 2;
+    this.frameSize = this.visionW * this.visionH * this.channels;
     this.actor = this._buildActor();
     this.critic = this._buildCritic();
     this.memory = [];
@@ -181,7 +187,7 @@ class CNNAgent {
   _convBase(model) {
     model.add(
       tf.layers.conv2d({
-        inputShape: [64, 64, 2],
+        inputShape: [this.visionH, this.visionW, this.channels],
         filters: 8,
         kernelSize: 8,
         strides: 4,
@@ -243,22 +249,25 @@ class CNNAgent {
     return m;
   }
 
-  // pixelDataBatch: Float32Array of size batchSize * 64 * 64 * 2
+  // pixelDataBatch: Float32Array of size count * frameSize (frameSize = W*H*2).
   predictBatch(pixelDataBatch, noiseScale = 0) {
     return tf.tidy(() => {
+      // Derive the batch count from the data length instead of assuming a fixed
+      // batch size, so a partial or resized batch reshapes correctly.
+      const count = pixelDataBatch.length / this.frameSize;
       const stateTensor = tf.tensor(pixelDataBatch, [
-        this.batchSize,
-        64,
-        64,
-        2
+        count,
+        this.visionH,
+        this.visionW,
+        this.channels
       ]);
-      const data = this.actor.predict(stateTensor).dataSync(); // batchSize * 3
+      const data = this.actor.predict(stateTensor).dataSync(); // count * 3
       // Clamp to [-1, 1] after adding exploration noise: the actor's output
       // is tanh-bounded, and these actions are later stored as regression
       // targets, so out-of-range values would be unreachable training goals.
       const clamp = (v) => Math.max(-1, Math.min(1, v));
       const actions = [];
-      for (let i = 0; i < this.batchSize; i++) {
+      for (let i = 0; i < count; i++) {
         actions.push([
           clamp(data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale),
           clamp(data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale),
@@ -271,7 +280,12 @@ class CNNAgent {
 
   getActivations(pixelData) {
     return tf.tidy(() => {
-      let t = tf.tensor(pixelData, [1, 64, 64, 2]);
+      let t = tf.tensor(pixelData, [
+        1,
+        this.visionH,
+        this.visionW,
+        this.channels
+      ]);
       for (let i = 0; i <= 3; i++) t = this.actor.layers[i].apply(t);
       const dense64 = t;
       const output3 = this.actor.layers[4].apply(dense64);
@@ -289,10 +303,16 @@ class CNNAgent {
     if (this.memory.length === 0) return null;
     const batchSize = this.memory.length;
 
-    const stateData = new Float32Array(batchSize * 64 * 64 * 2);
+    const fs = this.frameSize;
+    const stateData = new Float32Array(batchSize * fs);
     for (let i = 0; i < batchSize; i++)
-      stateData.set(this.memory[i].state, i * 64 * 64 * 2);
-    const stateTensor = tf.tensor(stateData, [batchSize, 64, 64, 2]);
+      stateData.set(this.memory[i].state, i * fs);
+    const stateTensor = tf.tensor(stateData, [
+      batchSize,
+      this.visionH,
+      this.visionW,
+      this.channels
+    ]);
     const actionTensor = tf.tensor2d(
       this.memory.map((m) => m.action),
       [batchSize, 3]
@@ -829,9 +849,12 @@ class TrajectoryTrails {
 
 class Dashboard {
   constructor() {
-    this.agentViewCtx = document
-      .getElementById("agent-view-canvas")
-      .getContext("2d");
+    // Size the stereo-view canvas from CONFIG (L|R side by side) so it tracks
+    // the vision resolution instead of assuming a fixed 128x64.
+    this.agentViewCanvas = document.getElementById("agent-view-canvas");
+    this.agentViewCanvas.width = CONFIG.visionWidth * 2;
+    this.agentViewCanvas.height = CONFIG.visionHeight;
+    this.agentViewCtx = this.agentViewCanvas.getContext("2d");
     this.kernelCtx = document.getElementById("kernel-canvas").getContext("2d");
     this.actCanvas = document.getElementById("act-canvas");
     this.actCtx = this.actCanvas.getContext("2d");
@@ -904,7 +927,8 @@ class Dashboard {
   drawAgentView(batch) {
     const W = CONFIG.visionWidth;
     const H = CONFIG.visionHeight;
-    const img = this.agentViewCtx.createImageData(128, 64);
+    const dW = W * 2; // combined L|R width
+    const img = this.agentViewCtx.createImageData(dW, H);
     for (let i = 0; i < W * H; i++) {
       const grayL = batch[i * 2];
       const grayR = batch[i * 2 + 1];
@@ -912,14 +936,14 @@ class Dashboard {
       const col = i % W;
       const invRow = H - 1 - row;
 
-      const idxL = (invRow * 128 + col) * 4;
+      const idxL = (invRow * dW + col) * 4;
       const valL = grayL * 255;
       img.data[idxL] = valL;
       img.data[idxL + 1] = valL;
       img.data[idxL + 2] = valL;
       img.data[idxL + 3] = 255;
 
-      const idxR = (invRow * 128 + (col + 64)) * 4;
+      const idxR = (invRow * dW + (col + W)) * 4;
       const valR = grayR * 255;
       img.data[idxR] = valR;
       img.data[idxR + 1] = valR;
