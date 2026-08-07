@@ -4,10 +4,12 @@ import * as CANNON from "https://esm.sh/cannon-es@0.19.0";
 
 const CONFIG = {
   // Balls simulated + trained on per batch. Each ball costs two stereo render
-  // passes plus two synchronous readRenderTargetPixels() readbacks every batch
-  // reset, so this is the dominant cost driver. 2048 stalls the tab for
-  // seconds per batch; 512 keeps the vision capture responsive while still
-  // giving the critic a large batch to fit.
+  // passes into the shared vision atlas; the whole batch is then read back with
+  // a single readRenderTargetPixels() per eye (see VisionSystem), so readback
+  // is no longer per-ball. The remaining per-ball cost is the render passes,
+  // which scale linearly and are far cheaper than the old synchronous readback
+  // stalls. Larger batches give the critic more to fit at the cost of a longer
+  // capture loop each reset.
   batchSize: 1024,
   visionWidth: 64,
   visionHeight: 64,
@@ -688,7 +690,7 @@ class Ball {
 }
 
 class VisionSystem {
-  constructor(renderer, scene) {
+  constructor(renderer, scene, batchSize) {
     this.renderer = renderer;
     this.scene = scene;
     const W = CONFIG.visionWidth;
@@ -697,18 +699,34 @@ class VisionSystem {
     this.H = H;
     this.frameSize = W * H * 2;
 
-    this.rtLeft = new THREE.WebGLRenderTarget(W, H);
-    this.rtRight = new THREE.WebGLRenderTarget(W, H);
+    // Atlas layout. Each ball's per-eye WxH view is a tile in a cols x rows
+    // grid packed into ONE render target per eye. This is the whole point of
+    // the rework: the old path did two synchronous readRenderTargetPixels()
+    // readbacks per ball (2 * batchSize GPU->CPU pipeline flushes per batch),
+    // which was the dominant per-batch stall. Rendering into a shared atlas
+    // lets a single readback per eye cover the entire batch — 2 flushes total,
+    // independent of batchSize.
+    this.cols = Math.ceil(Math.sqrt(batchSize));
+    this.rows = Math.ceil(batchSize / this.cols);
+    const atlasW = this.cols * W;
+    const atlasH = this.rows * H;
+    this.atlasW = atlasW;
+    this.atlasH = atlasH;
+
+    this.rtLeft = new THREE.WebGLRenderTarget(atlasW, atlasH);
+    this.rtRight = new THREE.WebGLRenderTarget(atlasW, atlasH);
     this.camLeft = new THREE.PerspectiveCamera(90, 1, 0.1, 200);
     this.camRight = new THREE.PerspectiveCamera(90, 1, 0.1, 200);
-    this.bufLeft = new Uint8Array(W * H * 4);
-    this.bufRight = new Uint8Array(W * H * 4);
+    this.bufLeft = new Uint8Array(atlasW * atlasH * 4);
+    this.bufRight = new Uint8Array(atlasW * atlasH * 4);
   }
 
   // Renders each ball's stereo view toward the hoop and packs grayscale L/R
-  // channels into one flat Float32Array [balls.length * frameSize].
+  // channels into one flat Float32Array [balls.length * frameSize]. The output
+  // packing order is identical to the old per-target path, so downstream
+  // consumers (agent state storage, drawAgentView) are unaffected.
   captureBatch(balls, hoopPos, court, manualMesh, trajectoryGroup) {
-    const { W, H, frameSize } = this;
+    const { W, H, frameSize, cols, atlasW } = this;
     const batch = new Float32Array(balls.length * frameSize);
 
     // Hide everything that shouldn't appear in the agents' vision.
@@ -717,6 +735,11 @@ class VisionSystem {
     manualMesh.visible = false;
     for (const b of balls) b.mesh.visible = false;
     court.setHighContrast(true);
+
+    // Confine each ball's render to its own tile. The scissor test keeps both
+    // the background clear and the draw inside the tile, so neighbouring tiles
+    // survive across the loop and the atlas fills up one ball at a time.
+    this.renderer.setScissorTest(true);
 
     const half = CONFIG.ipd / 2;
     for (let i = 0; i < balls.length; i++) {
@@ -733,42 +756,59 @@ class VisionSystem {
       this.camLeft.lookAt(hoopPos);
       this.camRight.lookAt(hoopPos);
 
+      const tileX = (i % cols) * W;
+      const tileY = Math.floor(i / cols) * H;
+
       this.renderer.setRenderTarget(this.rtLeft);
+      this.renderer.setViewport(tileX, tileY, W, H);
+      this.renderer.setScissor(tileX, tileY, W, H);
       this.renderer.render(this.scene, this.camLeft);
+
       this.renderer.setRenderTarget(this.rtRight);
+      this.renderer.setViewport(tileX, tileY, W, H);
+      this.renderer.setScissor(tileX, tileY, W, H);
       this.renderer.render(this.scene, this.camRight);
+    }
 
-      this.renderer.readRenderTargetPixels(
-        this.rtLeft,
-        0,
-        0,
-        W,
-        H,
-        this.bufLeft
-      );
-      this.renderer.readRenderTargetPixels(
-        this.rtRight,
-        0,
-        0,
-        W,
-        H,
-        this.bufRight
-      );
+    // One readback per eye covers every tile in the batch.
+    this.renderer.readRenderTargetPixels(
+      this.rtLeft,
+      0,
+      0,
+      atlasW,
+      this.atlasH,
+      this.bufLeft
+    );
+    this.renderer.readRenderTargetPixels(
+      this.rtRight,
+      0,
+      0,
+      atlasW,
+      this.atlasH,
+      this.bufRight
+    );
 
+    for (let i = 0; i < balls.length; i++) {
+      const tileX = (i % cols) * W;
+      const tileY = Math.floor(i / cols) * H;
       const offset = i * frameSize;
-      for (let p = 0; p < W * H; p++) {
-        const grayL =
-          (0.299 * this.bufLeft[p * 4] +
-            0.587 * this.bufLeft[p * 4 + 1] +
-            0.114 * this.bufLeft[p * 4 + 2]) /
-          255.0;
-        const grayR =
-          (0.299 * this.bufRight[p * 4] +
-            0.587 * this.bufRight[p * 4 + 1] +
-            0.114 * this.bufRight[p * 4 + 2]) /
-          255.0;
-        batch[offset + p * 2] = grayL;
-        batch[offset + p * 2 + 1] = grayR;
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const p = y * W + x;
+          const a = ((tileY + y) * atlasW + (tileX + x)) * 4;
+          const grayL =
+            (0.299 * this.bufLeft[a] +
+              0.587 * this.bufLeft[a + 1] +
+              0.114 * this.bufLeft[a + 2]) /
+            255.0;
+          const grayR =
+            (0.299 * this.bufRight[a] +
+              0.587 * this.bufRight[a + 1] +
+              0.114 * this.bufRight[a + 2]) /
+            255.0;
+          batch[offset + p * 2] = grayL;
+          batch[offset + p * 2 + 1] = grayR;
+        }
       }
     }
 
@@ -777,7 +817,9 @@ class VisionSystem {
     trajectoryGroup.visible = wasVizVisible;
     for (const b of balls) b.mesh.visible = true;
     manualMesh.visible = true;
+    this.renderer.setScissorTest(false);
     this.renderer.setRenderTarget(null);
+    this.renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
 
     return batch;
   }
@@ -1420,7 +1462,11 @@ class App {
 
     const scene = this.sceneMgr.scene;
     this.court = new Court(scene, this.physics, this.assets);
-    this.vision = new VisionSystem(this.sceneMgr.renderer, scene);
+    this.vision = new VisionSystem(
+      this.sceneMgr.renderer,
+      scene,
+      CONFIG.batchSize
+    );
     this.trajectory = new TrajectoryTrails(
       scene,
       this.assets,
