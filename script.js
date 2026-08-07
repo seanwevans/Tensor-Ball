@@ -18,7 +18,13 @@ const CONFIG = {
   l2: 0.001,
   maxHistory: 100,
   accuracyWindow: 1024,
+  // Exploration noise added to the actor's action before launch. It anneals
+  // once per trained batch (exploreNoise *= decay, floored at min) so the
+  // policy explores widely early and converges toward exploitation as it
+  // learns, instead of injecting a fixed ±0.2 jitter forever.
   exploreNoise: 0.4,
+  exploreNoiseMin: 0.05,
+  exploreNoiseDecay: 0.995,
   ipd: 0.2, // stereo interpupillary distance
   groups: { court: 1, ball: 2 },
   rim: { x: 41.75, y: 10, z: 0 }
@@ -607,6 +613,10 @@ class Ball {
       assets.batchBall
     );
     this.mesh.castShadow = true;
+    // Dormant until spawn(). Without this the mesh defaults to visible at the
+    // origin, so the whole batch would clump at center court until training
+    // first spawns them.
+    this.mesh.visible = false;
     scene.add(this.mesh);
 
     this.body = new CANNON.Body({
@@ -1113,6 +1123,7 @@ class TrainingArena {
     this.episodeStats = { count: 0, baskets: 0, shots: 0 };
     this.accuracyHistory = [];
     this.isTrainingStep = false;
+    this.exploreNoise = CONFIG.exploreNoise;
   }
 
   // Position all balls but don't launch (initial state / warm-up).
@@ -1132,7 +1143,7 @@ class TrainingArena {
       manualMesh,
       this.trajectory.group
     );
-    const actions = this.agent.predictBatch(batch, CONFIG.exploreNoise);
+    const actions = this.agent.predictBatch(batch, this.exploreNoise);
     const fs = this.vision.frameSize;
     for (let i = 0; i < this.balls.length; i++) {
       const b = this.balls[i];
@@ -1242,6 +1253,13 @@ class TrainingArena {
     } catch (e) {
       console.error("Train Error", e);
     }
+
+    // Anneal exploration once per trained batch so the policy tightens toward
+    // exploitation as it improves, with a floor that keeps a little jitter.
+    this.exploreNoise = Math.max(
+      CONFIG.exploreNoiseMin,
+      this.exploreNoise * CONFIG.exploreNoiseDecay
+    );
 
     this.resetBatch(manualMesh);
     this.isTrainingStep = false;
@@ -1567,7 +1585,9 @@ class App {
       trajectory: this.trajectory
     });
 
-    this.arena.spawnAll();
+    // Don't spawn the training batch at startup — the app opens in manual mode
+    // and the balls stay hidden until the user starts training (resetBatch
+    // spawns them). This avoids a startup flash of the whole batch.
     this.manual.reset();
     this._loop();
   }
