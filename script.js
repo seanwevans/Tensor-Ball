@@ -745,6 +745,15 @@ class VisionSystem {
 
     this.rtLeft = new THREE.WebGLRenderTarget(atlasW, atlasH);
     this.rtRight = new THREE.WebGLRenderTarget(atlasW, atlasH);
+    // Tiling lives on the render targets, not on the renderer. setViewport()/
+    // setScissor()/setScissorTest() write renderer globals that setRenderTarget()
+    // immediately overwrites from the bound target — and WebGLShadowMap.render()
+    // calls setRenderTarget() itself to rebind after drawing shadow maps, which
+    // happens inside every render(). Via the renderer API the tile rect was
+    // therefore dropped before the scene drew: each ball cleared and repainted
+    // the whole atlas, leaving every tile a crop of the *last* ball's view.
+    this.rtLeft.scissorTest = true;
+    this.rtRight.scissorTest = true;
     this.camLeft = new THREE.PerspectiveCamera(90, 1, 0.1, 200);
     this.camRight = new THREE.PerspectiveCamera(90, 1, 0.1, 200);
     this.bufLeft = new Uint8Array(atlasW * atlasH * 4);
@@ -766,11 +775,6 @@ class VisionSystem {
     for (const b of balls) b.mesh.visible = false;
     court.setHighContrast(true);
 
-    // Confine each ball's render to its own tile. The scissor test keeps both
-    // the background clear and the draw inside the tile, so neighbouring tiles
-    // survive across the loop and the atlas fills up one ball at a time.
-    this.renderer.setScissorTest(true);
-
     const half = CONFIG.ipd / 2;
     for (let i = 0; i < balls.length; i++) {
       const pos = balls[i].mesh.position;
@@ -789,14 +793,19 @@ class VisionSystem {
       const tileX = (i % cols) * W;
       const tileY = Math.floor(i / cols) * H;
 
+      // Confine each ball's render to its own tile. The scissor test keeps both
+      // the background clear and the draw inside the tile, so neighbouring tiles
+      // survive across the loop and the atlas fills up one ball at a time. The
+      // rect has to be set on the target *before* binding it — setRenderTarget()
+      // is what copies it into the active GL state.
+      this.rtLeft.viewport.set(tileX, tileY, W, H);
+      this.rtLeft.scissor.set(tileX, tileY, W, H);
       this.renderer.setRenderTarget(this.rtLeft);
-      this.renderer.setViewport(tileX, tileY, W, H);
-      this.renderer.setScissor(tileX, tileY, W, H);
       this.renderer.render(this.scene, this.camLeft);
 
+      this.rtRight.viewport.set(tileX, tileY, W, H);
+      this.rtRight.scissor.set(tileX, tileY, W, H);
       this.renderer.setRenderTarget(this.rtRight);
-      this.renderer.setViewport(tileX, tileY, W, H);
-      this.renderer.setScissor(tileX, tileY, W, H);
       this.renderer.render(this.scene, this.camRight);
     }
 
@@ -847,9 +856,9 @@ class VisionSystem {
     trajectoryGroup.visible = wasVizVisible;
     for (const b of balls) b.mesh.visible = true;
     manualMesh.visible = true;
-    this.renderer.setScissorTest(false);
+    // Unbinding restores the canvas viewport/scissor from the renderer globals,
+    // which this path never touches, so there is nothing else to put back.
     this.renderer.setRenderTarget(null);
-    this.renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
 
     return batch;
   }

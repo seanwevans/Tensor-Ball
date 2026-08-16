@@ -97,8 +97,11 @@ canvas {
 }
 
 #agent-view-canvas {
-  width: 128px;
-  height: 64px;
+  /* Sized from the canvas' own backing store, which the Dashboard derives from
+     CONFIG.visionWidth/visionHeight. Hardcoding 128x64 here silently stretched
+     the stereo pair as soon as the vision resolution changed. */
+  width: 100%;
+  height: auto;
   border: 1px solid #444;
   image-rendering: pixelated;
   margin-bottom: 10px;
