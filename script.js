@@ -10,9 +10,25 @@ const CONFIG = {
   // which scale linearly and are far cheaper than the old synchronous readback
   // stalls. Larger batches give the critic more to fit at the cost of a longer
   // capture loop each reset.
-  batchSize: 1024,
-  visionWidth: 64,
-  visionHeight: 64,
+  // Cut from 1024 to keep the higher-resolution retina inside a sane memory
+  // budget. Cost scales with visionWidth^2 * batchSize on both the readback
+  // atlas and the state tensor, so tripling the retina means dividing the batch
+  // by four to stay near the old footprint (~75MB each). Batches also finish
+  // sooner with fewer balls to simulate, so the policy updates more often.
+  batchSize: 256,
+  // Retina resolution per eye. World units are FEET throughout (the court is
+  // PlaneGeometry(94, 50), rim at 10ft, ball radius 0.4ft ~ 4.8in), which is
+  // what makes the eye geometry below comparable to a real head.
+  //
+  // At 90 deg, resolving 1px of stereo disparity from a human 63mm IPD needs
+  // 2 * distance / ipd pixels: ~97px at 10ft, ~194px at 20ft, ~435px at 45ft.
+  // The old 64px retina therefore had strictly sub-pixel disparity everywhere
+  // on the court (0.32px at 20ft) — the stereo channel was decorative, and the
+  // net had nothing but apparent hoop size to judge distance with. 192px puts
+  // mid-range shots over the 1px threshold; the far corners are still short,
+  // which would need either a narrower field or another resolution step.
+  visionWidth: 192,
+  visionHeight: 192,
   ballRadius: 0.4,
   learningRate: 0.001,
   l2: 0.001,
@@ -22,10 +38,37 @@ const CONFIG = {
   // once per trained batch (exploreNoise *= decay, floored at min) so the
   // policy explores widely early and converges toward exploitation as it
   // learns, instead of injecting a fixed ±0.2 jitter forever.
+  //
+  // The floor matters more here than in a typical actor-critic. The actor is
+  // trained by regressing onto its own past actions, so the spread of those
+  // actions IS the improvement signal — anneal the noise away and the update
+  // degenerates into "predict what you already predicted". The old
+  // 0.05/0.995 pair hit its floor after ~415 batches and starved the actor of
+  // signal long before the policy was any good; 0.15/0.999 takes ~980 batches
+  // and keeps a usable ±0.075 of jitter permanently.
   exploreNoise: 0.4,
-  exploreNoiseMin: 0.05,
-  exploreNoiseDecay: 0.995,
-  ipd: 0.2, // stereo interpupillary distance
+  exploreNoiseMin: 0.15,
+  exploreNoiseDecay: 0.999,
+  // Advantage-weighted regression. Weight = exp(standardizedAdvantage / temp),
+  // capped at clip. Advantages are standardized per batch because raw rewards
+  // span roughly [-5, +34], which would otherwise make the exponent's scale
+  // depend entirely on how many shots happened to drop that batch.
+  advantageTemp: 1.0,
+  advantageClip: 20.0,
+  // Interpupillary distance in feet. 0.2067ft = 63mm, the human adult mean.
+  // The eyes are placed level with the horizon on either side of the gaze
+  // direction and both verge on the target, which is what human eyes do when
+  // fixating — so distance shows up as parallax of the surrounding court
+  // against a hoop that stays centred, rather than as displacement of the hoop
+  // itself.
+  ipd: 0.2067,
+  // Field of view per eye, degrees. Kept at the original 90 so the agent keeps
+  // its peripheral view of the floor and court lines, which are its cues for
+  // where it is standing; depth resolution is bought with retina pixels above
+  // instead. Narrowing this is the cheaper lever if that trade is ever worth
+  // making — a 60 deg field would lift disparity at 20ft from 0.99px to 1.72px
+  // at identical cost — but it blinds the agent to everything but the hoop.
+  visionFov: 90,
   groups: { court: 1, ball: 2 },
   rim: { x: 41.75, y: 10, z: 0 }
 };
@@ -192,7 +235,14 @@ class CNNAgent {
   // Shared conv stack: conv(8) -> conv(16) -> flatten -> dense(64).
   // Layer indices [0],[1] are the two conv layers in BOTH nets — the weight
   // sync in train() depends on that alignment.
-  _convBase(model) {
+  //
+  // denseReg is null for the actor: dense(64) and the output head are the only
+  // trainable parts of the policy, and L2 on them pulls the policy toward
+  // constant zero output — i.e. the same shot from every position — which
+  // competes directly with an already-weak improvement signal. The critic keeps
+  // L2 everywhere, and since the critic owns the conv backbone the filters stay
+  // regularized regardless.
+  _convBase(model, denseReg = this.l2Reg) {
     model.add(
       tf.layers.conv2d({
         inputShape: [this.visionH, this.visionW, this.channels],
@@ -217,32 +267,30 @@ class CNNAgent {
       tf.layers.dense({
         units: 64,
         activation: "relu",
-        kernelRegularizer: this.l2Reg
+        kernelRegularizer: denseReg
       })
     );
   }
 
   _buildActor() {
     const m = tf.sequential();
-    this._convBase(m);
+    this._convBase(m, null);
     // The critic owns the shared conv backbone: train() copies the critic's
     // conv weights into the actor after every batch. Freeze the actor's two
-    // conv layers so actor.fit() doesn't waste work computing gradients that
-    // get overwritten, and so the actor's dense head trains against a stable
-    // feature extractor.
+    // conv layers so the actor update doesn't waste work computing gradients
+    // that get overwritten, and so the actor's dense head trains against a
+    // stable feature extractor.
     m.layers[0].trainable = false;
     m.layers[1].trainable = false;
-    m.add(
-      tf.layers.dense({
-        units: 3,
-        activation: "tanh",
-        kernelRegularizer: this.l2Reg
-      })
-    );
+    m.add(tf.layers.dense({ units: 3, activation: "tanh" }));
+    // Compiled so the model stays serializable for EXPORT POLICY, but the actor
+    // is not trained through fit() — see _fitActorWeighted, which needs a
+    // per-sample weighted loss that fit() cannot express in this tfjs version.
     m.compile({
       optimizer: tf.train.adam(this.learningRate),
       loss: "meanSquaredError"
     });
+    this.actorOptimizer = tf.train.adam(this.learningRate);
     return m;
   }
 
@@ -336,13 +384,38 @@ class CNNAgent {
     });
     const loss = criticHistory.history.loss ? criticHistory.history.loss[0] : 0;
 
-    // Actor: fit toward actions that beat the critic's value estimate.
+    // Actor: regress toward the actions taken, weighted by how far each beat
+    // the critic's value estimate.
+    //
+    // This replaces a hard `advantage > 0` filter that trained on the better
+    // half of the batch with every surviving sample weighted equally. That
+    // filter throws away the magnitude of the advantage entirely, so a shot
+    // that beat the baseline by a hair pulled exactly as hard as one that swept
+    // the net — the regression target collapsed toward the unweighted mean of
+    // roughly half the actions, which is close to the mean of all of them. The
+    // result was a policy that barely varied with the input image. Exponential
+    // weighting keeps every sample but lets the genuinely good ones dominate.
     const values = this.critic.predict(stateTensor);
     const advantages = rewardTensor.sub(values);
     const advantageData = advantages.dataSync();
-    const goodIndices = [];
+
+    let advMean = 0;
+    for (let i = 0; i < batchSize; i++) advMean += advantageData[i];
+    advMean /= batchSize;
+    let advVar = 0;
     for (let i = 0; i < batchSize; i++)
-      if (advantageData[i] > 0) goodIndices.push(i);
+      advVar += (advantageData[i] - advMean) ** 2;
+    const advStd = Math.sqrt(advVar / batchSize) || 1;
+
+    const weightData = new Float32Array(batchSize);
+    for (let i = 0; i < batchSize; i++) {
+      const z = (advantageData[i] - advMean) / advStd;
+      weightData[i] = Math.min(
+        CONFIG.advantageClip,
+        Math.exp(z / CONFIG.advantageTemp)
+      );
+    }
+    const weightTensor = tf.tensor1d(weightData);
 
     // Sync the shared conv layers (critic -> actor) BEFORE fitting the actor.
     // The actor's conv layers are frozen, so actor.fit() only adjusts its dense
@@ -355,26 +428,54 @@ class CNNAgent {
         this.actor.layers[i].setWeights(this.critic.layers[i].getWeights());
     });
 
-    if (goodIndices.length > 0) {
-      const idx = tf.tensor1d(goodIndices, "int32");
-      const goodStateTensor = tf.gather(stateTensor, idx);
-      const goodActionTensor = tf.gather(actionTensor, idx);
-      await this.actor.fit(goodStateTensor, goodActionTensor, {
-        epochs: 1,
-        verbose: 0
-      });
-      idx.dispose();
-      goodStateTensor.dispose();
-      goodActionTensor.dispose();
-    }
+    this._fitActorWeighted(stateTensor, actionTensor, weightTensor);
 
     stateTensor.dispose();
     actionTensor.dispose();
     rewardTensor.dispose();
     values.dispose();
     advantages.dispose();
+    weightTensor.dispose();
     this.memory = [];
     return loss;
+  }
+
+  // One epoch of minibatch Adam over a per-sample weighted MSE. model.fit()
+  // cannot do this: passing sampleWeight throws "Support sampleWeight is not
+  // implemented yet" in tfjs 4.x, so the update is driven explicitly. Minibatch
+  // size matches fit()'s default of 32 so the number of optimizer steps per
+  // batch is unchanged. Only trainableWeights are passed to minimize(), which
+  // already excludes the two frozen conv layers.
+  _fitActorWeighted(states, actions, weights, minibatch = 32) {
+    const n = states.shape[0];
+    const order = new Int32Array(n);
+    for (let i = 0; i < n; i++) order[i] = i;
+    for (let i = n - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = order[i];
+      order[i] = order[j];
+      order[j] = t;
+    }
+
+    const vars = this.actor.trainableWeights.map((w) => w.val);
+    for (let start = 0; start < n; start += minibatch) {
+      const slice = order.slice(start, Math.min(start + minibatch, n));
+      tf.tidy(() => {
+        const idx = tf.tensor1d(slice, "int32");
+        const xb = tf.gather(states, idx);
+        const yb = tf.gather(actions, idx);
+        const wb = tf.gather(weights, idx);
+        this.actorOptimizer.minimize(
+          () => {
+            const pred = this.actor.apply(xb, { training: true });
+            const perSample = pred.sub(yb).square().mean(1);
+            return perSample.mul(wb).mean();
+          },
+          false,
+          vars
+        );
+      });
+    }
   }
 
   async saveActor() {
@@ -754,8 +855,12 @@ class VisionSystem {
     // the whole atlas, leaving every tile a crop of the *last* ball's view.
     this.rtLeft.scissorTest = true;
     this.rtRight.scissorTest = true;
-    this.camLeft = new THREE.PerspectiveCamera(90, 1, 0.1, 200);
-    this.camRight = new THREE.PerspectiveCamera(90, 1, 0.1, 200);
+    // Aspect is W/H rather than a hardcoded 1 so a non-square retina doesn't
+    // silently stretch the view. Near plane sits just outside the ball so the
+    // agent never sees the inside of its own skin.
+    const aspect = W / H;
+    this.camLeft = new THREE.PerspectiveCamera(CONFIG.visionFov, aspect, 0.1, 200);
+    this.camRight = new THREE.PerspectiveCamera(CONFIG.visionFov, aspect, 0.1, 200);
     this.bufLeft = new Uint8Array(atlasW * atlasH * 4);
     this.bufRight = new Uint8Array(atlasW * atlasH * 4);
   }
@@ -916,7 +1021,12 @@ class Dashboard {
     this.agentViewCanvas.width = CONFIG.visionWidth * 2;
     this.agentViewCanvas.height = CONFIG.visionHeight;
     this.agentViewCtx = this.agentViewCanvas.getContext("2d");
-    this.kernelCtx = document.getElementById("kernel-canvas").getContext("2d");
+    this.kernelCanvas = document.getElementById("kernel-canvas");
+    this.kernelCtx = this.kernelCanvas.getContext("2d");
+    // Nearest-neighbour, not bilinear. An 8x8 kernel blown up to tile size with
+    // smoothing on turns every filter into a soft blob, which reads as "the
+    // filters never learned anything" no matter what the weights actually are.
+    this.kernelCtx.imageSmoothingEnabled = false;
     this.actCanvas = document.getElementById("act-canvas");
     this.actCtx = this.actCanvas.getContext("2d");
     this.lossCanvas = document.getElementById("loss-canvas");
@@ -1014,44 +1124,69 @@ class Dashboard {
     this.agentViewCtx.putImageData(img, 0, 0);
   }
 
+  // Draws the L1 filter bank: one column per filter, one row per input eye, so
+  // the left/right kernels of a filter sit above each other and the L/R
+  // asymmetry that encodes disparity is actually visible. Geometry comes from
+  // the weight tensor's own shape [kH, kW, inChannels, filters] rather than
+  // hardcoded 8/8/2 — otherwise the strided index silently reads garbage the
+  // moment the conv config changes.
   visualizeKernels(agent) {
-    const wData = agent.actor.layers[0].getWeights()[0].dataSync();
-    const numFilters = 8;
-    const kSize = 8;
-    const inChannels = 2;
-    this.kernelCtx.clearRect(0, 0, 256, 32);
+    const kernel = agent.actor.layers[0].getWeights()[0];
+    const [kH, kW, inChannels, numFilters] = kernel.shape;
+    const wData = kernel.dataSync();
 
-    let min = 9999;
-    let max = -9999;
+    const TILE = 32;
+    const PAD = 2;
+    const cv = this.kernelCanvas;
+    const needW = numFilters * TILE;
+    const needH = inChannels * TILE;
+    if (cv.width !== needW || cv.height !== needH) {
+      cv.width = needW;
+      cv.height = needH;
+      this.kernelCtx.imageSmoothingEnabled = false; // reset by a resize
+    }
+    this.kernelCtx.clearRect(0, 0, cv.width, cv.height);
+
+    let min = Infinity;
+    let max = -Infinity;
     for (let i = 0; i < wData.length; i++) {
       if (wData[i] < min) min = wData[i];
       if (wData[i] > max) max = wData[i];
     }
     const range = max - min || 1;
 
-    for (let f = 0; f < numFilters; f++) {
-      const imgData = this.kernelCtx.createImageData(kSize, kSize);
-      for (let y = 0; y < kSize; y++) {
-        for (let x = 0; x < kSize; x++) {
-          const idx =
-            y * (kSize * inChannels * numFilters) +
-            x * (inChannels * numFilters) +
-            0 * numFilters +
-            f;
-          const norm = (wData[idx] - min) / range;
-          const pxIdx = (y * kSize + x) * 4;
-          const c = Math.floor(norm * 255);
-          imgData.data[pxIdx] = c;
-          imgData.data[pxIdx + 1] = c;
-          imgData.data[pxIdx + 2] = c;
-          imgData.data[pxIdx + 3] = 255;
+    const tile = document.createElement("canvas");
+    tile.width = kW;
+    tile.height = kH;
+    const tileCtx = tile.getContext("2d");
+
+    for (let c = 0; c < inChannels; c++) {
+      for (let f = 0; f < numFilters; f++) {
+        const imgData = tileCtx.createImageData(kW, kH);
+        for (let y = 0; y < kH; y++) {
+          for (let x = 0; x < kW; x++) {
+            const idx =
+              y * (kW * inChannels * numFilters) +
+              x * (inChannels * numFilters) +
+              c * numFilters +
+              f;
+            const v = Math.floor(((wData[idx] - min) / range) * 255);
+            const p = (y * kW + x) * 4;
+            imgData.data[p] = v;
+            imgData.data[p + 1] = v;
+            imgData.data[p + 2] = v;
+            imgData.data[p + 3] = 255;
+          }
         }
+        tileCtx.putImageData(imgData, 0, 0);
+        this.kernelCtx.drawImage(
+          tile,
+          f * TILE,
+          c * TILE,
+          TILE - PAD,
+          TILE - PAD
+        );
       }
-      const tempCvs = document.createElement("canvas");
-      tempCvs.width = kSize;
-      tempCvs.height = kSize;
-      tempCvs.getContext("2d").putImageData(imgData, 0, 0);
-      this.kernelCtx.drawImage(tempCvs, f * 32, 0, 30, 30);
     }
   }
 
