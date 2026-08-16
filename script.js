@@ -916,7 +916,12 @@ class Dashboard {
     this.agentViewCanvas.width = CONFIG.visionWidth * 2;
     this.agentViewCanvas.height = CONFIG.visionHeight;
     this.agentViewCtx = this.agentViewCanvas.getContext("2d");
-    this.kernelCtx = document.getElementById("kernel-canvas").getContext("2d");
+    this.kernelCanvas = document.getElementById("kernel-canvas");
+    this.kernelCtx = this.kernelCanvas.getContext("2d");
+    // Nearest-neighbour, not bilinear. An 8x8 kernel blown up to tile size with
+    // smoothing on turns every filter into a soft blob, which reads as "the
+    // filters never learned anything" no matter what the weights actually are.
+    this.kernelCtx.imageSmoothingEnabled = false;
     this.actCanvas = document.getElementById("act-canvas");
     this.actCtx = this.actCanvas.getContext("2d");
     this.lossCanvas = document.getElementById("loss-canvas");
@@ -1014,44 +1019,69 @@ class Dashboard {
     this.agentViewCtx.putImageData(img, 0, 0);
   }
 
+  // Draws the L1 filter bank: one column per filter, one row per input eye, so
+  // the left/right kernels of a filter sit above each other and the L/R
+  // asymmetry that encodes disparity is actually visible. Geometry comes from
+  // the weight tensor's own shape [kH, kW, inChannels, filters] rather than
+  // hardcoded 8/8/2 — otherwise the strided index silently reads garbage the
+  // moment the conv config changes.
   visualizeKernels(agent) {
-    const wData = agent.actor.layers[0].getWeights()[0].dataSync();
-    const numFilters = 8;
-    const kSize = 8;
-    const inChannels = 2;
-    this.kernelCtx.clearRect(0, 0, 256, 32);
+    const kernel = agent.actor.layers[0].getWeights()[0];
+    const [kH, kW, inChannels, numFilters] = kernel.shape;
+    const wData = kernel.dataSync();
 
-    let min = 9999;
-    let max = -9999;
+    const TILE = 32;
+    const PAD = 2;
+    const cv = this.kernelCanvas;
+    const needW = numFilters * TILE;
+    const needH = inChannels * TILE;
+    if (cv.width !== needW || cv.height !== needH) {
+      cv.width = needW;
+      cv.height = needH;
+      this.kernelCtx.imageSmoothingEnabled = false; // reset by a resize
+    }
+    this.kernelCtx.clearRect(0, 0, cv.width, cv.height);
+
+    let min = Infinity;
+    let max = -Infinity;
     for (let i = 0; i < wData.length; i++) {
       if (wData[i] < min) min = wData[i];
       if (wData[i] > max) max = wData[i];
     }
     const range = max - min || 1;
 
-    for (let f = 0; f < numFilters; f++) {
-      const imgData = this.kernelCtx.createImageData(kSize, kSize);
-      for (let y = 0; y < kSize; y++) {
-        for (let x = 0; x < kSize; x++) {
-          const idx =
-            y * (kSize * inChannels * numFilters) +
-            x * (inChannels * numFilters) +
-            0 * numFilters +
-            f;
-          const norm = (wData[idx] - min) / range;
-          const pxIdx = (y * kSize + x) * 4;
-          const c = Math.floor(norm * 255);
-          imgData.data[pxIdx] = c;
-          imgData.data[pxIdx + 1] = c;
-          imgData.data[pxIdx + 2] = c;
-          imgData.data[pxIdx + 3] = 255;
+    const tile = document.createElement("canvas");
+    tile.width = kW;
+    tile.height = kH;
+    const tileCtx = tile.getContext("2d");
+
+    for (let c = 0; c < inChannels; c++) {
+      for (let f = 0; f < numFilters; f++) {
+        const imgData = tileCtx.createImageData(kW, kH);
+        for (let y = 0; y < kH; y++) {
+          for (let x = 0; x < kW; x++) {
+            const idx =
+              y * (kW * inChannels * numFilters) +
+              x * (inChannels * numFilters) +
+              c * numFilters +
+              f;
+            const v = Math.floor(((wData[idx] - min) / range) * 255);
+            const p = (y * kW + x) * 4;
+            imgData.data[p] = v;
+            imgData.data[p + 1] = v;
+            imgData.data[p + 2] = v;
+            imgData.data[p + 3] = 255;
+          }
         }
+        tileCtx.putImageData(imgData, 0, 0);
+        this.kernelCtx.drawImage(
+          tile,
+          f * TILE,
+          c * TILE,
+          TILE - PAD,
+          TILE - PAD
+        );
       }
-      const tempCvs = document.createElement("canvas");
-      tempCvs.width = kSize;
-      tempCvs.height = kSize;
-      tempCvs.getContext("2d").putImageData(imgData, 0, 0);
-      this.kernelCtx.drawImage(tempCvs, f * 32, 0, 30, 30);
     }
   }
 
