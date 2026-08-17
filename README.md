@@ -1,8 +1,13 @@
 # Tensor Ball
 
-A browser-based basketball reinforcement-learning playground. Hundreds of agents
+A browser-based basketball reinforcement-learning playground. A thousand agents
 learn to shoot a hoop from raw stereo vision, trained live in the tab with
 TensorFlow.js — no server, no build step.
+
+The whole batch is on the court at once. Every ball of every batch is drawn,
+shoots, and stays where it landed until the next batch spawns, so a single
+glance shows the entire policy: early on the shots scatter everywhere, and as
+the critic learns the cloud pulls in toward the rim.
 
 <img src="https://github.com/user-attachments/assets/d7765d49-cd3f-412c-bb49-44dbc7f32d08" />
 
@@ -34,6 +39,16 @@ terminal reward, so there's no temporal credit assignment.
 The live dashboards show the agent's stereo input, the learned first-layer
 filters, dense-layer activations, the critic's batch loss, and running accuracy.
 
+### Batch size vs. retina resolution
+
+The two are budgeted against each other in `CONFIG`, because every buffer in
+the pipeline — the capture atlas, the readback, the state tensor — scales with
+`batchSize * visionWidth * visionHeight * 2`. The defaults spend that budget on
+balls rather than pixels: 1024 balls at 96x96 per eye. Raising the resolution
+without lowering the batch (or vice versa) is what the numbers are there for;
+`maxAtlasDim` keeps the GPU-side capture bounded either way, by filling a
+capped atlas in as many passes as the batch needs.
+
 ## Controls
 
 The app opens in **manual mode** with a single ball you can play with:
@@ -48,6 +63,7 @@ The app opens in **manual mode** with a single ball you can play with:
 | Save the trained policy | **EXPORT POLICY** button (downloads the actor) |
 
 While training, the manual ball is disabled and the batch takes over the court.
+Stopping training clears the batch off the floor and hands the court back.
 
 ## Running locally
 
@@ -72,9 +88,9 @@ dashboard).
   running on WebGPU / WebGL / CPU.
 
 The code is one dependency-free `script.js`, organized into small classes:
-`SceneManager`, `PhysicsWorld`, `Court`, `Ball`, `VisionSystem` (stereo capture),
-`CNNAgent` (the network), `TrainingArena` (the RL loop), and `Dashboard` (the
-visualizations).
+`SceneManager`, `PhysicsWorld`, `Court`, `Ball`, `BallField` (the batch, drawn
+as one instanced mesh), `VisionSystem` (stereo capture), `CNNAgent` (the
+network), `TrainingArena` (the RL loop), and `Dashboard` (the visualizations).
 
 ### A note on dependencies & integrity
 
