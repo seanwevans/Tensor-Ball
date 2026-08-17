@@ -34,6 +34,28 @@ terminal reward, so there's no temporal credit assignment.
 The live dashboards show the agent's stereo input, the learned first-layer
 filters, dense-layer activations, the critic's batch loss, and running accuracy.
 
+### Training runs off the render clock
+
+Training is decoupled from what you see. The batch is simulated **headless** —
+the training balls are rigid bodies with no meshes and are never drawn — and
+each rendered frame fast-forwards as much physics as fits in a fixed wall-clock
+budget (`CONFIG.simBudgetMs`) instead of advancing one step per frame. A batch
+now takes as long as it takes to *compute*, rather than as long as a thousand
+balls take to fall.
+
+What the court shows instead is a **showcase**: the ten best shots the agent has
+taken are promoted once a second and replayed at normal speed, laying down
+trails as they go. It's a read-only view of training, so rendering can stutter
+or be throttled without costing a single shot. The `Shots/s` and `Render`
+readouts in the training panel report the two rates separately.
+
+Batch state is held as 8-bit luma (what the framebuffer actually produces) and
+converted to float a chunk at a time on its way to the GPU, so peak GPU
+residency is set by `CONFIG.gpuChunk` rather than by the batch size. Vision
+capture pages through a bounded atlas for the same reason. Between them, batch
+size and retina resolution can be raised without the memory footprint growing
+to match.
+
 ## Controls
 
 The app opens in **manual mode** with a single ball you can play with:
@@ -47,7 +69,8 @@ The app opens in **manual mode** with a single ball you can play with:
 | Start / stop learning | **START TRAINING** button |
 | Save the trained policy | **EXPORT POLICY** button (downloads the actor) |
 
-While training, the manual ball is disabled and the batch takes over the court.
+While training, the manual ball is hidden and the court switches to replaying
+the agent's best recent shots.
 
 ## Running locally
 
@@ -73,8 +96,15 @@ dashboard).
 
 The code is one dependency-free `script.js`, organized into small classes:
 `SceneManager`, `PhysicsWorld`, `Court`, `Ball`, `VisionSystem` (stereo capture),
-`CNNAgent` (the network), `TrainingArena` (the RL loop), and `Dashboard` (the
-visualizations).
+`CNNAgent` (the network), `TrainingArena` (the RL loop), `Showcase` (replay of
+the best shots), and `Dashboard` (the panels).
+
+Everything tunable lives in the `CONFIG` object at the top of `script.js`. The
+throughput-relevant knobs are `simBudgetMs` (physics fast-forwarded per rendered
+frame), `gpuChunk` (samples per GPU upload), `visionAtlasMax` (vision atlas page
+size), and `maxFlightSteps` (when to abandon a shot). `batchSize` and
+`visionWidth`/`visionHeight` still dominate the cost of a batch — they set how
+much pixel data every stage has to move.
 
 ### A note on dependencies & integrity
 

@@ -18,6 +18,51 @@ const CONFIG = {
   advantageClip: 20.0,
   ipd: 0.2067,
   visionFov: 60,
+
+  // --- Throughput -----------------------------------------------------------
+  // Training no longer runs at display rate. The old loop stepped physics once
+  // per requestAnimationFrame, so a batch could not finish faster than the
+  // slowest ball's real-time flight — roughly ten seconds of wall clock spent
+  // watching balls fall. These bound how much simulation is fast-forwarded per
+  // rendered frame: keep stepping until either the step cap or the wall-clock
+  // budget is hit, then yield so the browser can paint.
+  //
+  // simBudgetMs is the knob that trades framerate for learning rate. 20ms
+  // settles around 30fps of playback, which is plenty for watching ten balls
+  // arc toward a hoop; lower it if the view matters more than the learning
+  // rate, raise it if the reverse.
+  simBudgetMs: 20,
+  maxStepsPerFrame: 400,
+  // A shot that hasn't resolved in this many steps is abandoned. Launch
+  // impulses top out around 45 ft/s upward against 32.2 ft/s^2, so a full
+  // flight is ~170 steps; 300 is slack, and the old 600 just let the batch's
+  // stragglers hold everyone up for twice as long as any real shot needs.
+  maxFlightSteps: 300,
+  // Flight paths are recorded for playback only, so they are subsampled and
+  // stored in a preallocated Float32Array per ball. The old path recorded a
+  // fresh THREE.Vector3 every step for every ball — ~600k allocations per
+  // batch, all of it garbage the moment the batch ended.
+  pathStride: 3,
+  maxPathPoints: 110,
+  // Longest edge of one vision atlas page, in pixels. batchSize tiles no
+  // longer have to fit in a single render target: capture walks the batch in
+  // pages of (visionAtlasMax / visionWidth)^2 tiles. At 256px tiles that is
+  // 64 balls per page, which caps the readback buffers at 16MB per eye
+  // instead of the 268MB an all-in-one 8192x8192 atlas demanded.
+  visionAtlasMax: 2048,
+  // Samples per GPU upload during training. The state buffer is held on the
+  // CPU as bytes and converted to float a chunk at a time, so peak GPU
+  // residency is chunk * visionWidth * visionHeight * 2 * 4 bytes (~33MB at
+  // 64 x 256px) rather than the whole 537MB batch at once.
+  gpuChunk: 64,
+
+  // --- Visualization --------------------------------------------------------
+  // Rendering is decoupled from training: the batch is simulated headless (no
+  // meshes at all) and the court instead replays the best shots the agent has
+  // taken recently. Nothing here feeds back into learning.
+  showcaseCount: 10,
+  showcaseRefreshMs: 1000,
+
   groups: { court: 1, ball: 2 },
   rim: { x: 41.75, y: 10, z: 0 }
 };
@@ -178,7 +223,50 @@ class CNNAgent {
     this.frameSize = this.visionW * this.visionH * this.channels;
     this.actor = this._buildActor();
     this.critic = this._buildCritic();
-    this.memory = [];
+  }
+
+  // Uploads samples [start, start+count) of a byte-packed state buffer as a
+  // float tensor in [0, 1].
+  //
+  // States live on the CPU as one Uint8Array because that is exactly what the
+  // framebuffer readback produces — promoting luma to float32 at capture time
+  // quadrupled the buffer (537MB per batch at 256x256x1024) for zero extra
+  // information. The conversion is deferred to here and done a chunk at a
+  // time, so the float expansion only ever exists for CONFIG.gpuChunk samples.
+  //
+  // The subarray is a view, not a copy, and tf.tensor's Uint8Array ->
+  // Float32Array widening is a single native typed-array conversion; the
+  // divide happens on the GPU. Chunks are contiguous rather than shuffled:
+  // every sample in a batch is an independent random spawn, so batch order is
+  // already arbitrary and gathering scattered rows would force a slow
+  // element-by-element copy back on the CPU.
+  _chunkTensor(stateBytes, start, count) {
+    const fs = this.frameSize;
+    const sub = stateBytes.subarray(start * fs, (start + count) * fs);
+    return tf.tidy(() =>
+      tf
+        .tensor(
+          sub,
+          [count, this.visionH, this.visionW, this.channels],
+          "float32"
+        )
+        .div(255)
+    );
+  }
+
+  // Runs fn(chunkTensor, start, count) over the whole buffer in gpuChunk-sized
+  // pieces, disposing each chunk before the next is uploaded.
+  async _overChunks(stateBytes, count, fn) {
+    const chunk = CONFIG.gpuChunk;
+    for (let start = 0; start < count; start += chunk) {
+      const n = Math.min(chunk, count - start);
+      const x = this._chunkTensor(stateBytes, start, n);
+      try {
+        await fn(x, start, n);
+      } finally {
+        x.dispose();
+      }
+    }
   }
 
   // Shared conv stack: conv(8) -> conv(16) -> flatten -> dense(64).
@@ -254,43 +342,34 @@ class CNNAgent {
     return m;
   }
 
-  // pixelDataBatch: Float32Array of size count * frameSize (frameSize = W*H*2).
-  predictBatch(pixelDataBatch, noiseScale = 0) {
-    return tf.tidy(() => {
-      // Derive the batch count from the data length instead of assuming a fixed
-      // batch size, so a partial or resized batch reshapes correctly.
-      const count = pixelDataBatch.length / this.frameSize;
-      const stateTensor = tf.tensor(pixelDataBatch, [
-        count,
-        this.visionH,
-        this.visionW,
-        this.channels
-      ]);
-      const data = this.actor.predict(stateTensor).dataSync(); // count * 3
-      // Clamp to [-1, 1] after adding exploration noise: the actor's output
-      // is tanh-bounded, and these actions are later stored as regression
-      // targets, so out-of-range values would be unreachable training goals.
-      const clamp = (v) => Math.max(-1, Math.min(1, v));
-      const actions = [];
-      for (let i = 0; i < count; i++) {
-        actions.push([
-          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale),
-          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale),
-          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale)
-        ]);
-      }
-      return actions;
-    });
+  // stateBytes: Uint8Array of count * frameSize luma samples (frameSize=W*H*2).
+  // Writes count * 3 action components into `out` (a Float32Array). Chunked so
+  // inference on a full batch never needs the whole float expansion resident
+  // at once, and flat so a batch of launches costs no per-ball allocation.
+  predictBatch(stateBytes, count, out, noiseScale = 0) {
+    // Clamp to [-1, 1] after adding exploration noise: the actor's output
+    // is tanh-bounded, and these actions are later stored as regression
+    // targets, so out-of-range values would be unreachable training goals.
+    const clamp = (v) => Math.max(-1, Math.min(1, v));
+    const chunk = CONFIG.gpuChunk;
+    for (let start = 0; start < count; start += chunk) {
+      const n = Math.min(chunk, count - start);
+      const data = tf.tidy(() => {
+        const x = this._chunkTensor(stateBytes, start, n);
+        return this.actor.predict(x).dataSync(); // n * 3
+      });
+      for (let i = 0; i < n * 3; i++)
+        out[start * 3 + i] = clamp(
+          data[i] + (Math.random() - 0.5) * noiseScale
+        );
+    }
+    return out;
   }
 
-  getActivations(pixelData) {
+  // Activations for a single sample, addressed by its index in the batch.
+  getActivations(stateBytes, index) {
     return tf.tidy(() => {
-      let t = tf.tensor(pixelData, [
-        1,
-        this.visionH,
-        this.visionW,
-        this.channels
-      ]);
+      let t = this._chunkTensor(stateBytes, index, 1);
       for (let i = 0; i <= 3; i++) t = this.actor.layers[i].apply(t);
       const dense64 = t;
       const output3 = this.actor.layers[4].apply(dense64);
@@ -298,40 +377,51 @@ class CNNAgent {
     });
   }
 
-  store(pixelData, action, reward) {
-    this.memory.push({ state: pixelData, action, reward });
-  }
-
-  // Trains critic on returns, then actor on advantage-positive samples.
+  // Trains critic on returns, then the actor on advantage-weighted actions.
   // Returns the critic loss (or null if nothing to train on).
-  async train() {
-    if (this.memory.length === 0) return null;
-    const batchSize = this.memory.length;
+  //
+  // stateBytes/actions/rewards describe one batch; nothing is retained
+  // afterwards, so the caller owns (and may reuse) the state buffer.
+  //
+  // The whole step is chunked. Previously each of the three passes built a
+  // tensor over the entire batch, which at 1024 x 256x256x2 is 537MB of GPU
+  // residency per tensor — enough to thrash or fail outright. Now each pass
+  // walks the batch in gpuChunk pieces and the per-sample bookkeeping
+  // (values, advantages, weights) stays in plain typed arrays on the CPU,
+  // where it costs 4 bytes a sample.
+  async trainOnBatch(stateBytes, actions, rewards, count) {
+    if (count === 0) return null;
 
-    const fs = this.frameSize;
-    const stateData = new Float32Array(batchSize * fs);
-    for (let i = 0; i < batchSize; i++)
-      stateData.set(this.memory[i].state, i * fs);
-    const stateTensor = tf.tensor(stateData, [
-      batchSize,
-      this.visionH,
-      this.visionW,
-      this.channels
-    ]);
-    const actionTensor = tf.tensor2d(
-      this.memory.map((m) => m.action),
-      [batchSize, 3]
-    );
-    const rewardTensor = tf.tensor2d(
-      this.memory.map((m) => m.reward),
-      [batchSize, 1]
-    );
-
-    const criticHistory = await this.critic.fit(stateTensor, rewardTensor, {
-      epochs: 1,
-      verbose: 0
+    // --- Pass 1: critic regression onto realized reward ---------------------
+    // fit() is still used per chunk rather than a hand-rolled minimize() so
+    // the L2 regularizer losses and the Adam slot state keep behaving exactly
+    // as they did. batchSize 32 preserves the original optimizer step count.
+    let lossSum = 0;
+    let lossChunks = 0;
+    await this._overChunks(stateBytes, count, async (x, start, n) => {
+      const yb = tf.tensor2d(rewards.subarray(start, start + n), [n, 1]);
+      const history = await this.critic.fit(x, yb, {
+        epochs: 1,
+        batchSize: 32,
+        shuffle: false,
+        verbose: 0
+      });
+      yb.dispose();
+      if (history.history.loss) {
+        lossSum += history.history.loss[0] * n;
+        lossChunks += n;
+      }
     });
-    const loss = criticHistory.history.loss ? criticHistory.history.loss[0] : 0;
+    const loss = lossChunks > 0 ? lossSum / lossChunks : 0;
+
+    // --- Pass 2: value estimates for the whole batch ------------------------
+    // Read back as a CPU Float32Array so the advantage statistics below can be
+    // computed without holding a batch-wide tensor.
+    const values = new Float32Array(count);
+    await this._overChunks(stateBytes, count, (x, start, n) => {
+      const v = tf.tidy(() => this.critic.predict(x).dataSync());
+      values.set(v.subarray(0, n), start);
+    });
 
     // Actor: regress toward the actions taken, weighted by how far each beat
     // the critic's value estimate.
@@ -344,76 +434,61 @@ class CNNAgent {
     // roughly half the actions, which is close to the mean of all of them. The
     // result was a policy that barely varied with the input image. Exponential
     // weighting keeps every sample but lets the genuinely good ones dominate.
-    const values = this.critic.predict(stateTensor);
-    const advantages = rewardTensor.sub(values);
-    const advantageData = advantages.dataSync();
-
     let advMean = 0;
-    for (let i = 0; i < batchSize; i++) advMean += advantageData[i];
-    advMean /= batchSize;
+    for (let i = 0; i < count; i++) advMean += rewards[i] - values[i];
+    advMean /= count;
     let advVar = 0;
-    for (let i = 0; i < batchSize; i++)
-      advVar += (advantageData[i] - advMean) ** 2;
-    const advStd = Math.sqrt(advVar / batchSize) || 1;
+    for (let i = 0; i < count; i++)
+      advVar += (rewards[i] - values[i] - advMean) ** 2;
+    const advStd = Math.sqrt(advVar / count) || 1;
 
-    const weightData = new Float32Array(batchSize);
-    for (let i = 0; i < batchSize; i++) {
-      const z = (advantageData[i] - advMean) / advStd;
+    const weightData = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const z = (rewards[i] - values[i] - advMean) / advStd;
       weightData[i] = Math.min(
         CONFIG.advantageClip,
         Math.exp(z / CONFIG.advantageTemp)
       );
     }
-    const weightTensor = tf.tensor1d(weightData);
 
     // Sync the shared conv layers (critic -> actor) BEFORE fitting the actor.
-    // The actor's conv layers are frozen, so actor.fit() only adjusts its dense
-    // head — and that head should be trained against the same features the
-    // actor will use at inference. Syncing after the fit would instead train
-    // the head on the previous batch's stale features, then swap the backbone
-    // out from under it.
+    // The actor's conv layers are frozen, so the actor update only adjusts its
+    // dense head — and that head should be trained against the same features
+    // the actor will use at inference. Syncing after the fit would instead
+    // train the head on the previous batch's stale features, then swap the
+    // backbone out from under it.
     tf.tidy(() => {
       for (let i = 0; i < 2; i++)
         this.actor.layers[i].setWeights(this.critic.layers[i].getWeights());
     });
 
-    this._fitActorWeighted(stateTensor, actionTensor, weightTensor);
+    // --- Pass 3: advantage-weighted actor update ----------------------------
+    await this._overChunks(stateBytes, count, (x, start, n) => {
+      this._fitActorWeighted(x, actions, weightData, start, n);
+    });
 
-    stateTensor.dispose();
-    actionTensor.dispose();
-    rewardTensor.dispose();
-    values.dispose();
-    advantages.dispose();
-    weightTensor.dispose();
-    this.memory = [];
     return loss;
   }
 
-  // One epoch of minibatch Adam over a per-sample weighted MSE. model.fit()
-  // cannot do this: passing sampleWeight throws "Support sampleWeight is not
-  // implemented yet" in tfjs 4.x, so the update is driven explicitly. Minibatch
-  // size matches fit()'s default of 32 so the number of optimizer steps per
-  // batch is unchanged. Only trainableWeights are passed to minimize(), which
-  // already excludes the two frozen conv layers.
-  _fitActorWeighted(states, actions, weights, minibatch = 32) {
-    const n = states.shape[0];
-    const order = new Int32Array(n);
-    for (let i = 0; i < n; i++) order[i] = i;
-    for (let i = n - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const t = order[i];
-      order[i] = order[j];
-      order[j] = t;
-    }
-
+  // One epoch of minibatch Adam over a per-sample weighted MSE, restricted to
+  // samples [start, start+n) of the batch. model.fit() cannot do this: passing
+  // sampleWeight throws "Support sampleWeight is not implemented yet" in tfjs
+  // 4.x, so the update is driven explicitly. Minibatch size matches fit()'s
+  // default of 32 so the number of optimizer steps per batch is unchanged.
+  // Only trainableWeights are passed to minimize(), which already excludes the
+  // two frozen conv layers.
+  //
+  // Minibatches are cut out of the already-uploaded chunk with tf.slice, so
+  // splitting the batch into chunks costs no extra CPU->GPU traffic.
+  _fitActorWeighted(chunk, actions, weights, start, n, minibatch = 32) {
     const vars = this.actor.trainableWeights.map((w) => w.val);
-    for (let start = 0; start < n; start += minibatch) {
-      const slice = order.slice(start, Math.min(start + minibatch, n));
+    for (let off = 0; off < n; off += minibatch) {
+      const m = Math.min(minibatch, n - off);
+      const base = (start + off) * 3;
       tf.tidy(() => {
-        const idx = tf.tensor1d(slice, "int32");
-        const xb = tf.gather(states, idx);
-        const yb = tf.gather(actions, idx);
-        const wb = tf.gather(weights, idx);
+        const xb = chunk.slice([off, 0, 0, 0], [m, -1, -1, -1]);
+        const yb = tf.tensor2d(actions.subarray(base, base + m * 3), [m, 3]);
+        const wb = tf.tensor1d(weights.subarray(start + off, start + off + m));
         this.actorOptimizer.minimize(
           () => {
             const pred = this.actor.apply(xb, { training: true });
@@ -503,6 +578,12 @@ class PhysicsWorld {
     // is court-only), so sweep-and-prune's sorted-axis pruning is a pure win.
     this.world.broadphase = new CANNON.SAPBroadphase(this.world);
     this.world.solver.iterations = 10;
+    // Finished balls are put to sleep instead of being left to bounce and roll.
+    // Without this the world kept integrating and colliding every ball that had
+    // already been scored and banked for the rest of the batch — dead weight
+    // that grew as the batch drained, which is precisely when the remaining
+    // live shots most need the step budget.
+    this.world.allowSleep = true;
 
     this.concrete = new CANNON.Material("concrete");
     this.plastic = new CANNON.Material("plastic");
@@ -675,19 +756,19 @@ class Court {
   }
 }
 
+// A training ball is pure physics — no mesh, no material, nothing in the
+// render graph. The batch is simulated headless and never drawn; what the user
+// sees is the Showcase replaying recorded flight paths. Carrying 1024 shadow-
+// casting spheres through every frame cost more render time than the entire
+// learning step, and none of it was legible anyway at that density.
 class Ball {
-  constructor(id, scene, physics, assets, radius) {
+  constructor(id, physics, radius) {
     this.id = id;
-    this.mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(radius, 16, 16),
-      assets.batchBall
-    );
-    this.mesh.castShadow = true;
-    // Dormant until spawn(). Without this the mesh defaults to visible at the
-    // origin, so the whole batch would clump at center court until training
-    // first spawns them.
-    this.mesh.visible = false;
-    scene.add(this.mesh);
+
+    // Flight path, subsampled and preallocated: [x,y,z] triples, pathLen of
+    // maxPathPoints used. Only ever read back for playback of the best shots.
+    this.path = new Float32Array(CONFIG.maxPathPoints * 3);
+    this.pathLen = 0;
 
     this.body = new CANNON.Body({
       mass: 2,
@@ -705,16 +786,15 @@ class Ball {
 
   _resetState() {
     this.active = false;
-    this.startPixels = null;
-    this.action = [0, 0, 0];
-    this.path = [];
+    this.pathLen = 0;
+    this.steps = 0;
     this.minDist = 100;
     this.scored = false;
     this.hitBackboard = false;
     this.hitRim = false;
   }
 
-  // Position at a random launch spot and mark active/visible.
+  // Position at a random launch spot and mark active.
   spawn() {
     const x = Math.random() * 42;
     const z = (Math.random() - 0.5) * 46;
@@ -723,42 +803,57 @@ class Ball {
     this.body.velocity.set(0, 0, 0);
     this.body.angularVelocity.set(0, 0, 0);
     this.body.sleep();
-    this.mesh.position.copy(this.body.position);
-    this.mesh.quaternion.copy(this.body.quaternion);
 
     this._resetState();
     this.active = true;
-    this.mesh.visible = true;
+    this.record();
   }
 
-  syncMesh() {
-    this.mesh.position.copy(this.body.position);
-    this.mesh.quaternion.copy(this.body.quaternion);
+  // Append the current position to the flight path. Once the path is full the
+  // last slot is overwritten instead of dropping the sample, so a long shot's
+  // recorded endpoint is still where the ball actually ended up.
+  record() {
+    const p = this.body.position;
+    const i = this.pathLen < CONFIG.maxPathPoints ? this.pathLen++ : this.pathLen - 1;
+    const o = i * 3;
+    this.path[o] = p.x;
+    this.path[o + 1] = p.y;
+    this.path[o + 2] = p.z;
   }
 
-  // Apply the launch impulse derived from the agent's 3-vector action.
-  launch(action, hoopPos) {
-    this.action = action;
-    const start = this.mesh.position.clone();
-    const dirToHoop = new THREE.Vector3().subVectors(hoopPos, start);
-    dirToHoop.y = 0;
-    dirToHoop.normalize();
+  // Apply the launch impulse derived from the agent's 3-vector action, read
+  // from `actions` at `offset` (a flat batch-wide Float32Array).
+  launch(actions, offset, hoopPos) {
+    const p = this.body.position;
+    const dirToHoop = new THREE.Vector3(
+      hoopPos.x - p.x,
+      0,
+      hoopPos.z - p.z
+    ).normalize();
     const dirSide = new THREE.Vector3().crossVectors(UP, dirToHoop).normalize();
 
-    const magFwd = (action[0] + 1) * 50;
-    const magUp = (action[1] + 1) * 35 + 20;
-    const magSide = action[2] * 20;
-
-    const impulse = new THREE.Vector3()
-      .add(dirToHoop.multiplyScalar(magFwd))
-      .add(new THREE.Vector3(0, 1, 0).multiplyScalar(magUp))
-      .add(dirSide.multiplyScalar(magSide));
+    const magFwd = (actions[offset] + 1) * 50;
+    const magUp = (actions[offset + 1] + 1) * 35 + 20;
+    const magSide = actions[offset + 2] * 20;
 
     this.body.wakeUp();
     this.body.applyImpulse(
-      new CANNON.Vec3(impulse.x, impulse.y, impulse.z),
+      new CANNON.Vec3(
+        dirToHoop.x * magFwd + dirSide.x * magSide,
+        magUp,
+        dirToHoop.z * magFwd + dirSide.z * magSide
+      ),
       new CANNON.Vec3(0, 0, 0)
     );
+  }
+
+  // Stop simulating: zero the motion and sleep the body so the world stops
+  // spending broadphase and solver time on a shot that is already scored.
+  retire() {
+    this.active = false;
+    this.body.velocity.set(0, 0, 0);
+    this.body.angularVelocity.set(0, 0, 0);
+    this.body.sleep();
   }
 
   onContact(other, court) {
@@ -780,14 +875,23 @@ class VisionSystem {
     this.frameSize = W * H * 2;
 
     // Atlas layout. Each ball's per-eye WxH view is a tile in a cols x rows
-    // grid packed into ONE render target per eye. This is the whole point of
-    // the rework: the old path did two synchronous readRenderTargetPixels()
-    // readbacks per ball (2 * batchSize GPU->CPU pipeline flushes per batch),
-    // which was the dominant per-batch stall. Rendering into a shared atlas
-    // lets a single readback per eye cover the entire batch — 2 flushes total,
-    // independent of batchSize.
-    this.cols = Math.ceil(Math.sqrt(batchSize));
-    this.rows = Math.ceil(batchSize / this.cols);
+    // grid packed into one render target per eye, so a whole page of balls is
+    // read back with a single readRenderTargetPixels() per eye rather than the
+    // two GPU->CPU pipeline flushes per ball the original path needed.
+    //
+    // The atlas is now PAGED rather than sized to hold the entire batch. Fitting
+    // 1024 tiles of 256px meant an 8192x8192 target — at the texture-size limit
+    // of a lot of hardware, and 268MB of readback buffer per eye. Capacity is
+    // capped at visionAtlasMax on a side and captureBatch walks the batch one
+    // page at a time, which keeps the buffers at a fixed ~16MB per eye no
+    // matter how large the batch grows.
+    const maxTiles = Math.max(
+      1,
+      Math.floor(CONFIG.visionAtlasMax / W) * Math.floor(CONFIG.visionAtlasMax / H)
+    );
+    this.pageSize = Math.min(batchSize, maxTiles);
+    this.cols = Math.min(this.pageSize, Math.max(1, Math.floor(CONFIG.visionAtlasMax / W)));
+    this.rows = Math.ceil(this.pageSize / this.cols);
     const atlasW = this.cols * W;
     const atlasH = this.rows * H;
     this.atlasW = atlasW;
@@ -812,35 +916,76 @@ class VisionSystem {
     this.camRight = new THREE.PerspectiveCamera(CONFIG.visionFov, aspect, 0.1, 200);
     this.bufLeft = new Uint8Array(atlasW * atlasH * 4);
     this.bufRight = new Uint8Array(atlasW * atlasH * 4);
+    this._eye = new THREE.Vector3();
+    this._right = new THREE.Vector3();
   }
 
   // Renders each ball's stereo view toward the hoop and packs grayscale L/R
-  // channels into one flat Float32Array [balls.length * frameSize]. The output
-  // packing order is identical to the old per-target path, so downstream
-  // consumers (agent state storage, drawAgentView) are unaffected.
-  captureBatch(balls, hoopPos, court, manualMesh, trajectoryGroup) {
-    const { W, H, frameSize, cols, atlasW } = this;
-    const batch = new Float32Array(balls.length * frameSize);
+  // samples into `out`, a caller-owned Uint8Array of balls.length * frameSize.
+  //
+  // Output is 8-bit because the framebuffer it comes from is 8-bit: widening to
+  // float here bought no precision and quadrupled every downstream buffer. The
+  // agent converts to float per GPU chunk instead (CNNAgent._chunkTensor).
+  //
+  // `hidden` lists objects that must not appear in the agents' view.
+  captureBatch(balls, hoopPos, court, hidden, out) {
+    const shadows = this.renderer.shadowMap;
 
-    // Hide everything that shouldn't appear in the agents' vision.
-    const wasVizVisible = trajectoryGroup.visible;
-    trajectoryGroup.visible = false;
-    manualMesh.visible = false;
-    for (const b of balls) b.mesh.visible = false;
+    // Shadow maps are the single biggest capture cost and contribute nothing:
+    // the scene is switched to high contrast precisely so the agent sees hoop
+    // geometry rather than lighting. Every renderer.render() otherwise re-runs
+    // both shadow-casting lights, so a 1024-ball batch paid 2048 shadow passes
+    // on a completely static scene. Suspending autoUpdate skips the re-render
+    // while leaving the shader variants (and therefore the compiled programs)
+    // untouched — toggling shadowMap.enabled instead would force a full
+    // material recompile twice per batch.
+    const shadowAuto = shadows.autoUpdate;
+    shadows.autoUpdate = false;
+
+    const wasVisible = hidden.map((o) => o.visible);
+    for (const o of hidden) o.visible = false;
     court.setHighContrast(true);
 
-    const half = CONFIG.ipd / 2;
-    for (let i = 0; i < balls.length; i++) {
-      const pos = balls[i].mesh.position;
-      const dir = new THREE.Vector3().subVectors(hoopPos, pos).normalize();
-      const rightVec = new THREE.Vector3().crossVectors(dir, UP).normalize();
+    for (let start = 0; start < balls.length; start += this.pageSize) {
+      const n = Math.min(this.pageSize, balls.length - start);
+      this._renderPage(balls, start, n, hoopPos);
+      this._readPage(out, start, n);
+    }
 
-      this.camLeft.position
-        .copy(pos)
-        .sub(rightVec.clone().multiplyScalar(half));
-      this.camRight.position
-        .copy(pos)
-        .add(rightVec.clone().multiplyScalar(half));
+    // Restore.
+    court.setHighContrast(false);
+    for (let i = 0; i < hidden.length; i++) hidden[i].visible = wasVisible[i];
+    // Unbinding restores the canvas viewport/scissor from the renderer globals,
+    // which this path never touches, so there is nothing else to put back.
+    this.renderer.setRenderTarget(null);
+    shadows.autoUpdate = shadowAuto;
+    shadows.needsUpdate = shadowAuto;
+  }
+
+  // Draws balls [start, start+n) into one atlas page, one tile each per eye.
+  _renderPage(balls, start, n, hoopPos) {
+    const { W, H, cols } = this;
+    const half = CONFIG.ipd / 2;
+
+    for (let i = 0; i < n; i++) {
+      const pos = balls[start + i].body.position;
+      this._eye.set(
+        hoopPos.x - pos.x,
+        hoopPos.y - pos.y,
+        hoopPos.z - pos.z
+      ).normalize();
+      this._right.crossVectors(this._eye, UP).normalize().multiplyScalar(half);
+
+      this.camLeft.position.set(
+        pos.x - this._right.x,
+        pos.y - this._right.y,
+        pos.z - this._right.z
+      );
+      this.camRight.position.set(
+        pos.x + this._right.x,
+        pos.y + this._right.y,
+        pos.z + this._right.z
+      );
       this.camLeft.lookAt(hoopPos);
       this.camRight.lookAt(hoopPos);
 
@@ -862,59 +1007,41 @@ class VisionSystem {
       this.renderer.setRenderTarget(this.rtRight);
       this.renderer.render(this.scene, this.camRight);
     }
+  }
 
-    // One readback per eye covers every tile in the batch.
-    this.renderer.readRenderTargetPixels(
-      this.rtLeft,
-      0,
-      0,
-      atlasW,
-      this.atlasH,
-      this.bufLeft
-    );
-    this.renderer.readRenderTargetPixels(
-      this.rtRight,
-      0,
-      0,
-      atlasW,
-      this.atlasH,
-      this.bufRight
-    );
+  // One readback per eye covers the whole page; unpack the tiles into `out`.
+  _readPage(out, start, n) {
+    const { W, H, frameSize, cols, atlasW } = this;
+    const bl = this.bufLeft;
+    const br = this.bufRight;
 
-    for (let i = 0; i < balls.length; i++) {
+    // Only the rows this page actually filled. A trailing partial page (batch
+    // size not a multiple of page size) otherwise pays a full-atlas readback
+    // for a handful of tiles. Reading full width keeps the row stride equal to
+    // atlasW, which is what the unpack indexing below assumes.
+    const usedH = Math.ceil(n / cols) * H;
+
+    this.renderer.readRenderTargetPixels(this.rtLeft, 0, 0, atlasW, usedH, bl);
+    this.renderer.readRenderTargetPixels(this.rtRight, 0, 0, atlasW, usedH, br);
+
+    // Integer luma: 77/150/29 are the Rec.601 weights scaled by 256, so the
+    // shift replaces three float multiplies and a divide per pixel per eye.
+    // At 256x256x1024 this inner loop runs 67M times a batch, which is enough
+    // for the difference to be worth the squint.
+    for (let i = 0; i < n; i++) {
       const tileX = (i % cols) * W;
       const tileY = Math.floor(i / cols) * H;
-      const offset = i * frameSize;
+      let o = (start + i) * frameSize;
       for (let y = 0; y < H; y++) {
+        let a = ((tileY + y) * atlasW + tileX) * 4;
         for (let x = 0; x < W; x++) {
-          const p = y * W + x;
-          const a = ((tileY + y) * atlasW + (tileX + x)) * 4;
-          const grayL =
-            (0.299 * this.bufLeft[a] +
-              0.587 * this.bufLeft[a + 1] +
-              0.114 * this.bufLeft[a + 2]) /
-            255.0;
-          const grayR =
-            (0.299 * this.bufRight[a] +
-              0.587 * this.bufRight[a + 1] +
-              0.114 * this.bufRight[a + 2]) /
-            255.0;
-          batch[offset + p * 2] = grayL;
-          batch[offset + p * 2 + 1] = grayR;
+          out[o] = (77 * bl[a] + 150 * bl[a + 1] + 29 * bl[a + 2]) >> 8;
+          out[o + 1] = (77 * br[a] + 150 * br[a + 1] + 29 * br[a + 2]) >> 8;
+          o += 2;
+          a += 4;
         }
       }
     }
-
-    // Restore.
-    court.setHighContrast(false);
-    trajectoryGroup.visible = wasVizVisible;
-    for (const b of balls) b.mesh.visible = true;
-    manualMesh.visible = true;
-    // Unbinding restores the canvas viewport/scissor from the renderer globals,
-    // which this path never touches, so there is nothing else to put back.
-    this.renderer.setRenderTarget(null);
-
-    return batch;
   }
 }
 
@@ -927,10 +1054,17 @@ class TrajectoryTrails {
     scene.add(this.group);
   }
 
-  add(points, type, reward) {
-    if (points.length < 2) return;
+  // path: flat Float32Array of xyz triples, `len` points used. Taking the raw
+  // buffer instead of an array of THREE.Vector3 lets a recorded flight go
+  // straight into a BufferAttribute with no intermediate objects.
+  add(path, len, type, reward) {
+    if (len < 2) return;
 
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new THREE.BufferAttribute(path.subarray(0, len * 3), 3)
+    );
     const material = this.assets.trailMaterials[type].clone();
     let opacity = 0.05;
     if (type === "score") {
@@ -946,7 +1080,8 @@ class TrajectoryTrails {
     const spriteMat = this.assets.endpointMaterials[type].clone();
     spriteMat.opacity = Math.min(1.0, opacity + 0.2);
     const sprite = new THREE.Sprite(spriteMat);
-    sprite.position.copy(points[points.length - 1]);
+    const last = (len - 1) * 3;
+    sprite.position.set(path[last], path[last + 1], path[last + 2]);
     sprite.scale.set(1.5, 1.5, 1.5);
     this.group.add(sprite);
 
@@ -959,6 +1094,125 @@ class TrajectoryTrails {
       old.line.material.dispose();
       old.sprite.material.dispose();
     }
+  }
+}
+
+// The visible court, decoupled from training.
+//
+// Training runs headless and as fast as the machine allows — batches can now
+// resolve several times a second, which is far past the rate at which watching
+// 1024 simultaneous balls tells anyone anything. So the arena doesn't draw
+// itself. It offers every finished shot here, the Showcase keeps only the best
+// handful, and once a second it promotes them to a reel: their trails are laid
+// down and a small pool of real meshes replays the flights at normal speed.
+//
+// Nothing in this class feeds back into learning. Rendering can stall, skip, or
+// be throttled to zero and the agent's throughput is unaffected.
+class Showcase {
+  constructor(scene, assets, trails, { count, refreshMs }) {
+    this.count = count;
+    this.refreshMs = refreshMs;
+    this.trails = trails;
+
+    this.group = new THREE.Group();
+    scene.add(this.group);
+
+    const geometry = new THREE.SphereGeometry(CONFIG.ballRadius, 16, 16);
+    this.meshes = [];
+    for (let i = 0; i < count; i++) {
+      const m = new THREE.Mesh(geometry, assets.batchBall);
+      m.castShadow = true;
+      m.visible = false;
+      this.group.add(m);
+      this.meshes.push(m);
+    }
+
+    // Shots seen since the last promotion, best-first; capped at `count`.
+    this.candidates = [];
+    this.reel = [];
+    this.cursor = 0;
+    this.reelPoints = 0;
+    this.lastRefresh = 0;
+    this.bestReward = -Infinity;
+  }
+
+  // Offer a finished shot. Copies the path only if the shot is good enough to
+  // make the current top `count`, so a 1024-ball batch performs ~10 copies
+  // rather than 1024.
+  offer(ball, reward, type) {
+    if (ball.pathLen < 2) return;
+    if (
+      this.candidates.length >= this.count &&
+      reward <= this.candidates[this.candidates.length - 1].reward
+    )
+      return;
+
+    const shot = {
+      path: ball.path.slice(0, ball.pathLen * 3),
+      len: ball.pathLen,
+      reward,
+      type
+    };
+    let i = this.candidates.length;
+    while (i > 0 && this.candidates[i - 1].reward < reward) i--;
+    this.candidates.splice(i, 0, shot);
+    if (this.candidates.length > this.count) this.candidates.length = this.count;
+  }
+
+  // Promote the accumulated best shots to the visible reel, at most once per
+  // refreshMs. Returns true if the reel changed.
+  refresh(now) {
+    if (now - this.lastRefresh < this.refreshMs) return false;
+    this.lastRefresh = now;
+    if (this.candidates.length === 0) return false;
+
+    this.reel = this.candidates;
+    this.candidates = [];
+    this.cursor = 0;
+    this.reelPoints = 0;
+    this.bestReward = this.reel[0].reward;
+    for (const s of this.reel)
+      if (s.len > this.reelPoints) this.reelPoints = s.len;
+
+    // The trail history is bounded at CONFIG.maxHistory, so it now holds the
+    // last maxHistory *showcased* shots — roughly ten seconds of the agent's
+    // best work — instead of being flooded and evicted 1024 entries at a time
+    // by a single batch.
+    for (const s of this.reel) this.trails.add(s.path, s.len, s.type, s.reward);
+    return true;
+  }
+
+  // Advance playback. Paths were sampled every CONFIG.pathStride physics steps
+  // at 60Hz, so replaying that many points per second per stride puts the
+  // flights back at real speed regardless of how fast training is running.
+  update(dt) {
+    if (this.reel.length === 0) return;
+    this.cursor += (dt * 60) / CONFIG.pathStride;
+    if (this.cursor >= this.reelPoints) this.cursor = 0; // loop until refresh
+
+    const c = this.cursor;
+    const i0 = Math.floor(c);
+    const frac = c - i0;
+    for (let i = 0; i < this.meshes.length; i++) {
+      const mesh = this.meshes[i];
+      const shot = this.reel[i];
+      if (!shot || i0 >= shot.len) {
+        mesh.visible = false;
+        continue;
+      }
+      const a = i0 * 3;
+      const b = i0 + 1 < shot.len ? a + 3 : a;
+      mesh.position.set(
+        shot.path[a] + (shot.path[b] - shot.path[a]) * frac,
+        shot.path[a + 1] + (shot.path[b + 1] - shot.path[a + 1]) * frac,
+        shot.path[a + 2] + (shot.path[b + 2] - shot.path[a + 2]) * frac
+      );
+      mesh.visible = true;
+    }
+  }
+
+  hideAll() {
+    for (const m of this.meshes) m.visible = false;
   }
 }
 
@@ -984,11 +1238,42 @@ class Dashboard {
     this.tfStatus = document.getElementById("tf-backend-status");
     this.uiEp = document.getElementById("ep-count");
     this.uiBaskets = document.getElementById("baskets");
+    this.uiReward = document.getElementById("last-reward");
     this.uiAcc = document.getElementById("accuracy");
     this.uiStatus = document.getElementById("status");
     this.uiBatch = document.getElementById("batch-progress");
+    this.uiRate = document.getElementById("shot-rate");
+    this.uiFps = document.getElementById("fps");
+    this.uiAgVert = document.getElementById("ag-fy");
+    this.uiAgFwd = document.getElementById("ag-fx");
+    this.uiAgAim = document.getElementById("ag-fz");
+    this.uiAgResult = document.getElementById("ag-result");
+    this.uiAgReward = document.getElementById("ag-reward");
 
     this.lossHistory = [];
+
+    // Throughput counters, flushed to the UI once a second.
+    this._shots = 0;
+    this._frames = 0;
+    this._rateSince = performance.now();
+  }
+
+  // Called once per rendered frame with the shots retired since the last call.
+  // Reporting the two rates separately is the point: they are now independent,
+  // and seeing shots/sec hold steady while fps moves (or vice versa) is how you
+  // confirm the visualization really is off the training path.
+  tickRates(shots, now) {
+    this._shots += shots;
+    this._frames++;
+    const elapsed = now - this._rateSince;
+    if (elapsed < 1000) return;
+    const perSec = 1000 / elapsed;
+    if (this.uiRate)
+      this.uiRate.innerText = Math.round(this._shots * perSec) + "/s";
+    if (this.uiFps) this.uiFps.innerText = Math.round(this._frames * perSec);
+    this._shots = 0;
+    this._frames = 0;
+    this._rateSince = now;
   }
 
   setBackend(name, ok) {
@@ -1005,10 +1290,27 @@ class Dashboard {
     if (this.uiBatch) this.uiBatch.innerText = text;
   }
 
-  setStats({ accuracy, baskets, episodes }) {
+  // Fills the "Last Agent Decision" panel from the flat action buffer. The
+  // component order is the one Ball.launch() reads: 0 forward, 1 vertical,
+  // 2 aim.
+  setAgentDecision(actions, offset, reward, scored) {
+    const fmt = (v) => (v >= 0 ? "+" : "") + v.toFixed(3);
+    this.uiAgFwd.innerText = fmt(actions[offset]);
+    this.uiAgVert.innerText = fmt(actions[offset + 1]);
+    this.uiAgAim.innerText = fmt(actions[offset + 2]);
+    this.uiAgResult.innerText = scored ? "BASKET" : "MISS";
+    this.uiAgResult.className = scored ? "outcome-score" : "outcome-miss";
+    this.uiAgReward.innerText = reward.toFixed(2);
+  }
+
+  setStats({ accuracy, baskets, episodes, meanReward }) {
     this.uiAcc.innerText = Math.round(accuracy * 100) + "%";
     this.uiBaskets.innerText = baskets;
     this.uiEp.innerText = episodes;
+    // Mean over the batch rather than a single shot's reward: with a thousand
+    // shots resolving at once there is no meaningful "last" one, and the batch
+    // mean is the number that actually tracks whether the policy is improving.
+    if (this.uiReward) this.uiReward.innerText = meanReward.toFixed(2);
   }
 
   pushLoss(loss) {
@@ -1044,27 +1346,29 @@ class Dashboard {
     this.lossCtx.stroke();
   }
 
-  drawAgentView(batch) {
+  // Draws sample `index` out of a byte-packed state batch as a side-by-side
+  // L|R pair. Values are already 0-255 luma, so they go straight into the
+  // ImageData with no rescaling.
+  drawAgentView(stateBytes, index) {
     const W = CONFIG.visionWidth;
     const H = CONFIG.visionHeight;
     const dW = W * 2; // combined L|R width
+    const base = index * W * H * 2;
     const img = this.agentViewCtx.createImageData(dW, H);
     for (let i = 0; i < W * H; i++) {
-      const grayL = batch[i * 2];
-      const grayR = batch[i * 2 + 1];
       const row = Math.floor(i / W);
       const col = i % W;
       const invRow = H - 1 - row;
 
       const idxL = (invRow * dW + col) * 4;
-      const valL = grayL * 255;
+      const valL = stateBytes[base + i * 2];
       img.data[idxL] = valL;
       img.data[idxL + 1] = valL;
       img.data[idxL + 2] = valL;
       img.data[idxL + 3] = 255;
 
       const idxR = (invRow * dW + (col + W)) * 4;
-      const valR = grayR * 255;
+      const valR = stateBytes[base + i * 2 + 1];
       img.data[idxR] = valR;
       img.data[idxR + 1] = valR;
       img.data[idxR + 2] = valR;
@@ -1194,7 +1498,10 @@ class Dashboard {
       );
       ctx.fill();
     }
-    const labels = ["V", "F", "A"];
+    // Matches Ball.launch()'s component order: 0 forward, 1 vertical, 2 aim.
+    // These were labelled V/F/A, transposing the first two against the action
+    // the ball is actually launched with.
+    const labels = ["F", "V", "A"];
     for (let i = 0; i < 3; i++) {
       const val = (output[i] + 1) / 2;
       const intensity = Math.min(255, Math.floor(val * 255));
@@ -1210,21 +1517,12 @@ class Dashboard {
 }
 
 class TrainingArena {
-  constructor({
-    agent,
-    scene,
-    physics,
-    assets,
-    court,
-    vision,
-    dashboard,
-    trajectory
-  }) {
+  constructor({ agent, physics, court, vision, dashboard, showcase }) {
     this.agent = agent;
     this.court = court;
     this.vision = vision;
     this.dashboard = dashboard;
-    this.trajectory = trajectory;
+    this.showcase = showcase;
 
     this.hoopPos = court.rimPosition;
     this.hoopPosCannon = court.rimPositionCannon;
@@ -1232,59 +1530,61 @@ class TrainingArena {
     this.balls = [];
     this.bodyToBall = new Map();
     for (let i = 0; i < CONFIG.batchSize; i++) {
-      const b = new Ball(i, scene, physics, assets, CONFIG.ballRadius);
+      const b = new Ball(i, physics, CONFIG.ballRadius);
       this.balls.push(b);
       this.bodyToBall.set(b.body, b);
     }
 
+    // Batch-wide buffers, allocated once and reused for every batch. The old
+    // path allocated a fresh Float32Array per batch plus a per-ball slice of
+    // it — at 1024 x 256x256x2 that is 537MB of allocation and 537MB of
+    // garbage per batch, which on its own was enough to stall the tab.
+    const fs = this.vision.frameSize;
+    this.stateBytes = new Uint8Array(CONFIG.batchSize * fs);
+    this.actions = new Float32Array(CONFIG.batchSize * 3);
+    this.rewards = new Float32Array(CONFIG.batchSize);
+
     this.episodeStats = { count: 0, baskets: 0, shots: 0 };
     this.accuracyHistory = [];
     this.isTrainingStep = false;
+    this.activeCount = 0;
     this.exploreNoise = CONFIG.exploreNoise;
-  }
-
-  // Position all balls but don't launch (initial state / warm-up).
-  spawnAll() {
-    for (const b of this.balls) b.spawn();
-    this.dashboard.setBatchProgress("Simulating...");
+    // Objects that must be hidden from the agents' cameras during capture.
+    this.hiddenDuringCapture = [];
   }
 
   // Spawn, capture vision, predict, and launch a fresh batch.
-  resetBatch(manualMesh) {
-    this.spawnAll();
+  resetBatch() {
+    for (const b of this.balls) b.spawn();
+    this.activeCount = this.balls.length;
+    this.dashboard.setBatchProgress("Simulating...");
 
-    const batch = this.vision.captureBatch(
+    this.vision.captureBatch(
       this.balls,
       this.hoopPos,
       this.court,
-      manualMesh,
-      this.trajectory.group
+      this.hiddenDuringCapture,
+      this.stateBytes
     );
-    const actions = this.agent.predictBatch(batch, this.exploreNoise);
-    const fs = this.vision.frameSize;
-    for (let i = 0; i < this.balls.length; i++) {
-      const b = this.balls[i];
-      b.startPixels = batch.slice(i * fs, (i + 1) * fs);
-      b.launch(actions[i], this.hoopPos);
-    }
-
-    this.dashboard.visualizeActivations(
-      this.agent.getActivations(this.balls[0].startPixels)
+    this.agent.predictBatch(
+      this.stateBytes,
+      this.balls.length,
+      this.actions,
+      this.exploreNoise
     );
-    this.dashboard.visualizeKernels(this.agent);
-    this.dashboard.drawAgentView(batch);
+    for (let i = 0; i < this.balls.length; i++)
+      this.balls[i].launch(this.actions, i * 3, this.hoopPos);
   }
 
-  // Per-frame update; returns the number of finished (inactive) balls.
+  // Advance one simulated step; returns the number of balls still in flight.
   update() {
-    let finished = 0;
+    let active = 0;
+    const stride = CONFIG.pathStride;
     for (const b of this.balls) {
-      if (!b.active) {
-        finished++;
-        continue;
-      }
-      b.syncMesh();
-      b.path.push(b.mesh.position.clone());
+      if (!b.active) continue;
+
+      b.steps++;
+      if (b.steps % stride === 0) b.record();
 
       const dist = b.body.position.distanceTo(this.hoopPosCannon);
       if (dist < b.minDist) b.minDist = dist;
@@ -1300,29 +1600,31 @@ class TrainingArena {
       // hoop, well above the floor. (Replaces the old y < -2 check, which the
       // infinite floor plane made unreachable.)
       const isOnFloor = b.body.position.y < CONFIG.ballRadius + 0.15;
-      const isTimeout = b.path.length > 600;
+      const isTimeout = b.steps > CONFIG.maxFlightSteps;
 
       if (
         b.scored ||
         isOnFloor ||
         isOOB ||
-        (isStopped && b.path.length > 10) ||
+        (isStopped && b.steps > 10) ||
         isTimeout
       ) {
-        b.active = false;
-        b.mesh.visible = false;
+        b.record(); // pin the path's endpoint to where the shot actually ended
+        b.retire();
+      } else {
+        active++;
       }
     }
-    return finished;
+    this.activeCount = active;
+    return active;
   }
 
   _reward(b) {
     let shotDistance = 0;
-    if (b.path.length > 0) {
-      const launchPos = b.path[0];
+    if (b.pathLen > 0) {
       shotDistance = Math.sqrt(
-        Math.pow(launchPos.x - this.hoopPos.x, 2) +
-          Math.pow(launchPos.z - this.hoopPos.z, 2)
+        Math.pow(b.path[0] - this.hoopPos.x, 2) +
+          Math.pow(b.path[2] - this.hoopPos.z, 2)
       );
     }
     if (b.scored) {
@@ -1335,16 +1637,24 @@ class TrainingArena {
     return { reward, type: "miss" };
   }
 
-  // Compute rewards, store transitions, train, then relaunch. Re-entrant-guarded.
-  async finishBatch(manualMesh) {
+  // Compute rewards, train, then relaunch. Re-entrant-guarded.
+  async finishBatch() {
     if (this.isTrainingStep) return;
     this.isTrainingStep = true;
 
-    for (const b of this.balls) {
+    const n = this.balls.length;
+    let best = 0;
+    let rewardSum = 0;
+    for (let i = 0; i < n; i++) {
+      const b = this.balls[i];
       const { reward, type } = this._reward(b);
+      this.rewards[i] = reward;
+      rewardSum += reward;
+      if (reward > this.rewards[best]) best = i;
       if (b.scored) this.episodeStats.baskets++;
-      this.trajectory.add(b.path, type, reward);
-      this.agent.store(b.startPixels, b.action, reward);
+      // The showcase decides on its own what is worth drawing and copies only
+      // those paths; every other flight in the batch is simply discarded.
+      this.showcase.offer(b, reward, type);
       this.episodeStats.shots++;
       this.episodeStats.count++;
       this.accuracyHistory.push(b.scored ? 1 : 0);
@@ -1360,26 +1670,56 @@ class TrainingArena {
     this.dashboard.setStats({
       accuracy: rollingAcc,
       baskets: this.episodeStats.baskets,
-      episodes: this.episodeStats.count
+      episodes: this.episodeStats.count,
+      meanReward: rewardSum / n
     });
     this.dashboard.setBatchProgress("Training GPU...");
 
-    try {
-      const loss = await this.agent.train();
-      if (loss != null) this.dashboard.pushLoss(loss);
-    } catch (e) {
-      console.error("Train Error", e);
-    }
-
-    // Anneal exploration once per trained batch so the policy tightens toward
-    // exploitation as it improves, with a floor that keeps a little jitter.
-    this.exploreNoise = Math.max(
-      CONFIG.exploreNoiseMin,
-      this.exploreNoise * CONFIG.exploreNoiseDecay
+    // The dashboards show the batch's best shot rather than ball 0 — with the
+    // court no longer showing the batch, an arbitrary sample was the one view
+    // of what the agent is doing, and a random miss is the least informative
+    // choice available. Drawn before training so it matches the weights that
+    // actually produced the shot.
+    this.dashboard.drawAgentView(this.stateBytes, best);
+    this.dashboard.visualizeActivations(
+      this.agent.getActivations(this.stateBytes, best)
+    );
+    this.dashboard.visualizeKernels(this.agent);
+    this.dashboard.setAgentDecision(
+      this.actions,
+      best * 3,
+      this.rewards[best],
+      this.balls[best].scored
     );
 
-    this.resetBatch(manualMesh);
-    this.isTrainingStep = false;
+    // finally, not a trailing assignment: finishBatch is fired without being
+    // awaited, so anything that escaped from here would leave isTrainingStep
+    // latched and stall training permanently with no visible error.
+    try {
+      const loss = await this.agent.trainOnBatch(
+        this.stateBytes,
+        this.actions,
+        this.rewards,
+        n
+      );
+      if (loss != null) this.dashboard.pushLoss(loss);
+
+      // Anneal exploration once per trained batch so the policy tightens toward
+      // exploitation as it improves, with a floor that keeps a little jitter.
+      this.exploreNoise = Math.max(
+        CONFIG.exploreNoiseMin,
+        this.exploreNoise * CONFIG.exploreNoiseDecay
+      );
+    } catch (e) {
+      console.error("Train Error", e);
+    } finally {
+      // Relaunching in finally so a failed training step costs one batch
+      // rather than wedging the simulation: the loop only advances again once
+      // there are live balls to advance.
+      this.resetBatch();
+      this.isTrainingStep = false;
+    }
+    return n;
   }
 }
 
@@ -1434,8 +1774,17 @@ class ManualBall {
     this.reset();
   }
 
+  // Disabling also hides and sleeps the ball. It used to stay visible and
+  // dynamic during training, which under fast-forward meant it dropped to the
+  // floor at whatever multiple of real time the sim was running at and then sat
+  // there — a stray ball on a court that is otherwise showing the agent's best
+  // work.
   setEnabled(v) {
     this.enabled = v;
+    this.mesh.visible = v;
+    this.arrow.visible = false;
+    if (v) this.body.wakeUp();
+    else this.body.sleep();
   }
 
   reset() {
@@ -1607,6 +1956,10 @@ class App {
       this.assets,
       CONFIG.maxHistory
     );
+    this.showcase = new Showcase(scene, this.assets, this.trajectory, {
+      count: CONFIG.showcaseCount,
+      refreshMs: CONFIG.showcaseRefreshMs
+    });
     this.manual = new ManualBall(
       scene,
       this.physics,
@@ -1618,6 +1971,7 @@ class App {
     this.agent = null;
     this.arena = null;
     this.trainingMode = false;
+    this.lastFrame = performance.now();
 
     this._wireContacts();
     this._wireButtons();
@@ -1660,8 +2014,11 @@ class App {
       btnTrain.classList.toggle("active");
       this.manual.setEnabled(!this.trainingMode);
       this.manual.reset();
-      if (this.trainingMode && this.arena)
-        this.arena.resetBatch(this.manual.mesh);
+      if (this.arena) {
+        if (this.trainingMode) this.arena.resetBatch();
+        else for (const b of this.arena.balls) b.retire();
+      }
+      if (!this.trainingMode) this.showcase.hideAll();
     });
 
     btnExport.addEventListener("click", async () => {
@@ -1693,14 +2050,20 @@ class App {
     });
     this.arena = new TrainingArena({
       agent: this.agent,
-      scene: this.sceneMgr.scene,
       physics: this.physics,
-      assets: this.assets,
       court: this.court,
       vision: this.vision,
       dashboard: this.dashboard,
-      trajectory: this.trajectory
+      showcase: this.showcase
     });
+    // Everything the agents must not see. The training balls themselves are no
+    // longer in this list because they no longer have meshes at all.
+    this.arena.hiddenDuringCapture = [
+      this.manual.mesh,
+      this.manual.arrow,
+      this.trajectory.group,
+      this.showcase.group
+    ];
 
     // Don't spawn the training batch at startup — the app opens in manual mode
     // and the balls stay hidden until the user starts training (resetBatch
@@ -1709,23 +2072,55 @@ class App {
     this._loop();
   }
 
+  // One rendered frame. Simulation and rendering are deliberately on different
+  // clocks here: the frame draws whatever the showcase is replaying, while the
+  // batch underneath is advanced as many steps as the budget allows. A batch
+  // therefore takes as long as it takes to *compute*, not as long as the balls
+  // take to fall.
   _loop() {
     requestAnimationFrame(() => this._loop());
-    this.physics.step();
 
-    if (this.arena) {
-      const finished = this.arena.update();
-      if (this.trainingMode && !this.arena.isTrainingStep) {
-        if (finished === CONFIG.batchSize)
-          this.arena.finishBatch(this.manual.mesh);
-        else
-          this.dashboard.setBatchProgress(
-            `${CONFIG.batchSize - finished} Active`
-          );
+    const now = performance.now();
+    // Clamped so a long training stall (or a backgrounded tab) doesn't make
+    // playback jump — the reel should always look like real-time basketball.
+    const dt = Math.min(0.1, (now - this.lastFrame) / 1000);
+    this.lastFrame = now;
+
+    let retired = 0;
+    if (this.trainingMode && this.arena) {
+      if (!this.arena.isTrainingStep) {
+        // Fast-forward the batch. Bounded by wall clock rather than a fixed
+        // step count so the budget holds across machines: a fast GPU gets more
+        // simulation per frame, a slow one still yields in time to paint.
+        const deadline = now + CONFIG.simBudgetMs;
+        let steps = 0;
+        while (
+          steps < CONFIG.maxStepsPerFrame &&
+          this.arena.activeCount > 0 &&
+          performance.now() < deadline
+        ) {
+          this.physics.step();
+          this.arena.update();
+          steps++;
+        }
+        if (this.arena.activeCount === 0) {
+          retired = CONFIG.batchSize;
+          // Deliberately not awaited: training resolves across later frames
+          // while rendering keeps running, and isTrainingStep guards re-entry.
+          this.arena.finishBatch();
+        } else {
+          this.dashboard.setBatchProgress(`${this.arena.activeCount} Active`);
+        }
       }
+    } else {
+      // Manual mode runs at real time — it's a person aiming a ball.
+      this.physics.step();
     }
 
     this.manual.update();
+    this.showcase.refresh(now);
+    this.showcase.update(dt);
+    this.dashboard.tickRates(retired, now);
     this.sceneMgr.render();
   }
 }
