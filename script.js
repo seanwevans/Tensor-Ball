@@ -50,7 +50,32 @@ const CONFIG = {
   ipd: 0.2067,
   visionFov: 60,
   groups: { court: 1, ball: 2 },
-  rim: { x: 41.75, y: 10, z: 0 }
+  rim: { x: 41.75, y: 10, z: 0 },
+  // Which way the ball went through the hoop is the whole game, so the two
+  // directions sit at opposite ends of the reward scale rather than a hair
+  // apart. Dropping in from above is the only outcome worth learning. Sailing
+  // up through the rim from underneath is the outcome most easily mistaken for
+  // it: the ball passes dead through the middle, so its closest approach is ~0
+  // and it usually clips the rim on the way, which under proximity shaping
+  // alone made it score better than every honest miss in the batch — a shape
+  // the policy can exploit by learning to fire straight up through the net.
+  reward: {
+    // Made basket, bonused by how far out the shot was launched from.
+    score: 25.0,
+    scoreDistanceScale: 20.0,
+    // Flat penalty for entering the hoop from below, applied instead of the
+    // rim/backboard bonuses. Deep enough to sit well below the worst honest
+    // miss, whose proximity term bottoms out near -5.
+    illegalEntry: -20.0,
+    rim: 2.0,
+    backboard: 0.5,
+    missDistanceScale: 10.0
+  },
+  // Calling a sensor crossing "came up through the hoop" takes more than an
+  // upward velocity: a ball rattling on the rim from above can clip the sensor
+  // while bouncing back up. Require real ascent, and require the ball to be in
+  // the column of the hoop rather than hanging off its edge.
+  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55 }
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -125,7 +150,11 @@ class Assets {
     this.trailMaterials = {
       score: trail(0x00ff00, 0.3),
       rim: trail(0xffff00, 0.3),
-      miss: trail(0xff0000, 0.15)
+      miss: trail(0xff0000, 0.15),
+      // Wrong-way hoop entries get their own color: their trails run through
+      // the rim exactly like a made basket's, so without a distinct magenta
+      // there is no way to see the policy chasing the penalty from the court.
+      illegal: trail(0xff00ff, 0.35)
     };
 
     const endpoint = (color, opacity) =>
@@ -140,7 +169,8 @@ class Assets {
     this.endpointMaterials = {
       score: endpoint(0x00ff00, 0.8),
       rim: endpoint(0xffff00, 0.8),
-      miss: endpoint(0xff0000, 0.4)
+      miss: endpoint(0xff0000, 0.4),
+      illegal: endpoint(0xff00ff, 0.8)
     };
   }
 
@@ -790,6 +820,22 @@ class BallField {
   }
 }
 
+// What a touch of the scoring sensor means, decided by the direction of travel:
+// "down" through the rim is a basket, "up" through it is an illegal entry from
+// below, and "none" is a graze that is neither — a ball hanging off the rim's
+// edge or bouncing back up off it after coming down from above.
+//
+// Shared by the batch balls and the manual ball so both agree on what counts.
+function classifyHoopCrossing(body, court) {
+  const vy = body.velocity.y;
+  if (vy < 0) return "down";
+  if (vy <= CONFIG.hoopEntry.minAscentSpeed) return "none";
+  const dx = body.position.x - court.rimPositionCannon.x;
+  const dz = body.position.z - court.rimPositionCannon.z;
+  const r = CONFIG.hoopEntry.columnRadius;
+  return dx * dx + dz * dz <= r * r ? "up" : "none";
+}
+
 class Ball {
   constructor(id, field, physics, radius) {
     this.id = id;
@@ -819,6 +865,7 @@ class Ball {
     this.path = [];
     this.minDist = 100;
     this.scored = false;
+    this.enteredFromBelow = false;
     this.hitBackboard = false;
     this.hitRim = false;
   }
@@ -882,9 +929,16 @@ class Ball {
   }
 
   onContact(other, court) {
-    if (other === court.scoringSensor && this.body.velocity.y < 0)
-      this.scored = true;
-    else if (other === court.backboardBody) this.hitBackboard = true;
+    if (other === court.scoringSensor) {
+      const crossing = classifyHoopCrossing(this.body, court);
+      // A ball that has already come up through the hoop cannot score on the
+      // way back down, matching the real rule: entering from below kills the
+      // ball. Without this a shot fired straight up through the net collects
+      // the basket reward on its own descent.
+      if (crossing === "up") this.enteredFromBelow = true;
+      else if (crossing === "down" && !this.enteredFromBelow)
+        this.scored = true;
+    } else if (other === court.backboardBody) this.hitBackboard = true;
     else if (other === court.rimBody) this.hitRim = true;
   }
 }
@@ -1108,8 +1162,16 @@ class TrajectoryTrails {
     const material = this.assets.trailMaterials[type].clone();
     let opacity = 0.05;
     if (type === "score") {
-      const t = Math.max(0, Math.min(1, (reward - 10) / 25));
+      // Brightness tracks the distance bonus. Reward is score * (1 + d/scale),
+      // so reward / score - 1 is the bonus in units of the base score, and the
+      // ramp stays correct if the reward scale is retuned.
+      const t = Math.max(
+        0,
+        Math.min(1, (reward / CONFIG.reward.score - 1) / 2)
+      );
       opacity = 0.3 + t * 0.7;
+    } else if (type === "illegal") {
+      opacity = 0.35;
     } else if (type === "rim") {
       opacity = 0.2;
     }
@@ -1158,6 +1220,7 @@ class Dashboard {
     this.tfStatus = document.getElementById("tf-backend-status");
     this.uiEp = document.getElementById("ep-count");
     this.uiBaskets = document.getElementById("baskets");
+    this.uiIllegal = document.getElementById("illegal-entries");
     this.uiAcc = document.getElementById("accuracy");
     this.uiStatus = document.getElementById("status");
     this.uiBatch = document.getElementById("batch-progress");
@@ -1179,10 +1242,11 @@ class Dashboard {
     if (this.uiBatch) this.uiBatch.innerText = text;
   }
 
-  setStats({ accuracy, baskets, episodes }) {
+  setStats({ accuracy, baskets, episodes, illegalEntries }) {
     this.uiAcc.innerText = Math.round(accuracy * 100) + "%";
     this.uiBaskets.innerText = baskets;
     this.uiEp.innerText = episodes;
+    if (this.uiIllegal) this.uiIllegal.innerText = illegalEntries;
   }
 
   pushLoss(loss) {
@@ -1424,7 +1488,7 @@ class TrainingArena {
     // which is 150MB of pointless copying per batch at batchSize 1024.
     this.batchPixels = null;
 
-    this.episodeStats = { count: 0, baskets: 0, shots: 0 };
+    this.episodeStats = { count: 0, baskets: 0, shots: 0, illegal: 0 };
     this.accuracyHistory = [];
     this.isTrainingStep = false;
     this.exploreNoise = CONFIG.exploreNoise;
@@ -1523,14 +1587,21 @@ class TrainingArena {
           Math.pow(launchPos.z - this.hoopPos.z, 2)
       );
     }
+    const R = CONFIG.reward;
     if (b.scored) {
-      const reward = 10.0 * (1.0 + shotDistance / 20.0);
+      const reward = R.score * (1.0 + shotDistance / R.scoreDistanceScale);
       return { reward, type: "score" };
     }
-    let reward = -b.minDist / 10;
-    if (b.hitRim) return { reward: reward + 2.0, type: "rim" };
-    if (b.hitBackboard) return { reward: reward + 0.5, type: "rim" };
-    return { reward, type: "miss" };
+    const proximity = -b.minDist / R.missDistanceScale;
+    // Through the hoop the wrong way. Its proximity term is the best in the
+    // batch — the ball passed through the middle of the rim — so the penalty
+    // has to be flat and large enough to swamp it, and it replaces the rim
+    // bonus the same shot would otherwise collect on its way up.
+    if (b.enteredFromBelow)
+      return { reward: proximity + R.illegalEntry, type: "illegal" };
+    if (b.hitRim) return { reward: proximity + R.rim, type: "rim" };
+    if (b.hitBackboard) return { reward: proximity + R.backboard, type: "rim" };
+    return { reward: proximity, type: "miss" };
   }
 
   // Compute rewards, store transitions, train, then relaunch. Re-entrant-guarded.
@@ -1543,6 +1614,7 @@ class TrainingArena {
     for (const b of this.balls) {
       const { reward, type } = this._reward(b);
       if (b.scored) this.episodeStats.baskets++;
+      if (b.enteredFromBelow) this.episodeStats.illegal++;
       this.trajectory.add(b.path, type, reward);
       actions.push(b.action);
       rewards.push(reward);
@@ -1564,7 +1636,8 @@ class TrainingArena {
     this.dashboard.setStats({
       accuracy: rollingAcc,
       baskets: this.episodeStats.baskets,
-      episodes: this.episodeStats.count
+      episodes: this.episodeStats.count,
+      illegalEntries: this.episodeStats.illegal
     });
     this.dashboard.setBatchProgress("Training GPU...");
 
@@ -1645,6 +1718,7 @@ class ManualBall {
   reset() {
     this.inProgress = false;
     this.scored = false;
+    this.enteredFromBelow = false;
     const x = Math.random() * 42;
     const z = (Math.random() - 0.5) * 46;
     const y = 4.5 + Math.random() * 1.5;
@@ -1657,8 +1731,10 @@ class ManualBall {
   }
 
   onContact(other, court) {
-    if (other === court.scoringSensor && this.body.velocity.y < 0)
-      this.scored = true;
+    if (other !== court.scoringSensor) return;
+    const crossing = classifyHoopCrossing(this.body, court);
+    if (crossing === "up") this.enteredFromBelow = true;
+    else if (crossing === "down" && !this.enteredFromBelow) this.scored = true;
   }
 
   update() {

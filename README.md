@@ -30,9 +30,14 @@ terminal reward, so there's no temporal credit assignment.
   batch, and frozen in the actor) and learns a launch action. It imitates only
   the actions that beat the critic's value estimate (positive advantage), a form
   of self-imitation / advantage-weighted regression.
-- **Reward** — a made basket scores highest (bonused by shot distance); near
-  misses are shaped by how close the ball got to the rim, with small bonuses for
-  hitting the rim or backboard.
+- **Reward** — a made basket scores far and away the highest (bonused by shot
+  distance); near misses are shaped by how close the ball got to the rim, with
+  small bonuses for hitting the rim or backboard. Direction through the hoop is
+  what separates the top of the scale from the bottom: a ball that comes *up*
+  through the rim from underneath takes a large flat penalty and is barred from
+  scoring on the way back down, because its proximity shaping is otherwise the
+  best in the batch and shooting straight up through the net would be the
+  easiest policy to learn.
 - **Exploration** — Gaussian-ish noise added to actions, annealed over training
   so the agent explores widely early and exploits as it improves.
 
