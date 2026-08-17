@@ -3,72 +3,21 @@ import { OrbitControls } from "https://esm.sh/three@0.132.2/examples/jsm/control
 import * as CANNON from "https://esm.sh/cannon-es@0.19.0";
 
 const CONFIG = {
-  // Balls simulated + trained on per batch. Each ball costs two stereo render
-  // passes into the shared vision atlas; the whole batch is then read back with
-  // a single readRenderTargetPixels() per eye (see VisionSystem), so readback
-  // is no longer per-ball. The remaining per-ball cost is the render passes,
-  // which scale linearly and are far cheaper than the old synchronous readback
-  // stalls. Larger batches give the critic more to fit at the cost of a longer
-  // capture loop each reset.
-  // Cut from 1024 to keep the higher-resolution retina inside a sane memory
-  // budget. Cost scales with visionWidth^2 * batchSize on both the readback
-  // atlas and the state tensor, so tripling the retina means dividing the batch
-  // by four to stay near the old footprint (~75MB each). Batches also finish
-  // sooner with fewer balls to simulate, so the policy updates more often.
-  batchSize: 256,
-  // Retina resolution per eye. World units are FEET throughout (the court is
-  // PlaneGeometry(94, 50), rim at 10ft, ball radius 0.4ft ~ 4.8in), which is
-  // what makes the eye geometry below comparable to a real head.
-  //
-  // At 90 deg, resolving 1px of stereo disparity from a human 63mm IPD needs
-  // 2 * distance / ipd pixels: ~97px at 10ft, ~194px at 20ft, ~435px at 45ft.
-  // The old 64px retina therefore had strictly sub-pixel disparity everywhere
-  // on the court (0.32px at 20ft) — the stereo channel was decorative, and the
-  // net had nothing but apparent hoop size to judge distance with. 192px puts
-  // mid-range shots over the 1px threshold; the far corners are still short,
-  // which would need either a narrower field or another resolution step.
-  visionWidth: 192,
-  visionHeight: 192,
+  batchSize: 1024,
+  visionWidth: 256,
+  visionHeight: 256,
   ballRadius: 0.4,
   learningRate: 0.001,
   l2: 0.001,
   maxHistory: 100,
   accuracyWindow: 1024,
-  // Exploration noise added to the actor's action before launch. It anneals
-  // once per trained batch (exploreNoise *= decay, floored at min) so the
-  // policy explores widely early and converges toward exploitation as it
-  // learns, instead of injecting a fixed ±0.2 jitter forever.
-  //
-  // The floor matters more here than in a typical actor-critic. The actor is
-  // trained by regressing onto its own past actions, so the spread of those
-  // actions IS the improvement signal — anneal the noise away and the update
-  // degenerates into "predict what you already predicted". The old
-  // 0.05/0.995 pair hit its floor after ~415 batches and starved the actor of
-  // signal long before the policy was any good; 0.15/0.999 takes ~980 batches
-  // and keeps a usable ±0.075 of jitter permanently.
   exploreNoise: 0.4,
   exploreNoiseMin: 0.15,
   exploreNoiseDecay: 0.999,
-  // Advantage-weighted regression. Weight = exp(standardizedAdvantage / temp),
-  // capped at clip. Advantages are standardized per batch because raw rewards
-  // span roughly [-5, +34], which would otherwise make the exponent's scale
-  // depend entirely on how many shots happened to drop that batch.
   advantageTemp: 1.0,
   advantageClip: 20.0,
-  // Interpupillary distance in feet. 0.2067ft = 63mm, the human adult mean.
-  // The eyes are placed level with the horizon on either side of the gaze
-  // direction and both verge on the target, which is what human eyes do when
-  // fixating — so distance shows up as parallax of the surrounding court
-  // against a hoop that stays centred, rather than as displacement of the hoop
-  // itself.
   ipd: 0.2067,
-  // Field of view per eye, degrees. Kept at the original 90 so the agent keeps
-  // its peripheral view of the floor and court lines, which are its cues for
-  // where it is standing; depth resolution is bought with retina pixels above
-  // instead. Narrowing this is the cheaper lever if that trade is ever worth
-  // making — a 60 deg field would lift disparity at 20ft from 0.99px to 1.72px
-  // at identical cost — but it blinds the agent to everything but the hoop.
-  visionFov: 90,
+  visionFov: 60,
   groups: { court: 1, ball: 2 },
   rim: { x: 41.75, y: 10, z: 0 }
 };
