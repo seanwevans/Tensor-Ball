@@ -3,9 +3,40 @@ import { OrbitControls } from "https://esm.sh/three@0.132.2/examples/jsm/control
 import * as CANNON from "https://esm.sh/cannon-es@0.19.0";
 
 const CONFIG = {
+  // Balls simulated, rendered and trained on per batch. The whole batch is on
+  // the court at once — watching a thousand shots converge IS the demo — so
+  // batchSize is the fixed quantity here and everything else is budgeted
+  // around it. Two things make 1024 affordable:
+  //   - the batch is drawn as a single InstancedMesh (see BallField), so 1024
+  //     balls cost one draw call per pass instead of 1024;
+  //   - the vision atlas is captured in bounded passes (see VisionSystem), so
+  //     GPU memory no longer scales with batchSize.
   batchSize: 1024,
-  visionWidth: 256,
-  visionHeight: 256,
+  // Retina resolution per eye. World units are FEET throughout (the court is
+  // PlaneGeometry(94, 50), rim at 10ft, ball radius 0.4ft ~ 4.8in), which is
+  // what makes the eye geometry below comparable to a real head.
+  //
+  // This is the knob that pays for the batch size: every buffer in the
+  // pipeline scales with batchSize * W * H * 2, so resolution and ball count
+  // trade off directly against each other. At 96px the state tensor is ~75MB
+  // (1024 * 96 * 96 * 2 * 4B) — the same footprint the smaller-batch,
+  // higher-resolution configs were tuned to.
+  //
+  // 96px is also about the floor for the stereo channel to mean anything. One
+  // pixel of disparity from the 63mm IPD below needs ipd * f_px / d >= 1,
+  // where f_px = (W/2) / tan(fov/2) = 83.1 at 96px / 60deg: that is ~1.7px at
+  // 10ft and ~0.86px at 20ft. Mid-range shots clear it, the far corners do
+  // not. Going below ~64px makes disparity sub-pixel everywhere and the second
+  // eye becomes decorative.
+  visionWidth: 96,
+  visionHeight: 96,
+  // Cap on either dimension of the stereo capture atlas. batchSize tiles of
+  // visionWidth would be a 3072px atlas at these settings and an 8192px one at
+  // 256px/eye — past MAX_TEXTURE_SIZE on plenty of GPUs (and 512MB of render
+  // target). VisionSystem instead fills an atlas of at most this size and
+  // repeats the fill/readback until the batch is covered, so no config choice
+  // can blow out GPU memory.
+  maxAtlasDim: 4096,
   ballRadius: 0.4,
   learningRate: 0.001,
   l2: 0.001,
@@ -73,6 +104,15 @@ class Assets {
       roughness: 0.4,
       metalness: 0.1
     });
+    // Per-instance tints multiplied over batchBall's color. Balls that have
+    // finished their shot stay on the court until the next batch spawns —
+    // the scatter of where a thousand shots ended up is the clearest picture
+    // of what the policy currently does — so they need to read as spent
+    // rather than in flight.
+    this.ballTint = {
+      live: new THREE.Color(1, 1, 1),
+      spent: new THREE.Color(0.3, 0.22, 0.16)
+    };
 
     const trail = (color, opacity) =>
       new THREE.LineBasicMaterial({
@@ -178,7 +218,9 @@ class CNNAgent {
     this.frameSize = this.visionW * this.visionH * this.channels;
     this.actor = this._buildActor();
     this.critic = this._buildCritic();
-    this.memory = [];
+    // The pending batch, set by store() and consumed by train(). One object
+    // for the whole batch, not one per sample.
+    this.memory = null;
   }
 
   // Shared conv stack: conv(8) -> conv(16) -> flatten -> dense(64).
@@ -298,34 +340,29 @@ class CNNAgent {
     });
   }
 
-  store(pixelData, action, reward) {
-    this.memory.push({ state: pixelData, action, reward });
+  // Takes the batch whole: states is one contiguous Float32Array holding
+  // count * frameSize pixels in the same order as actions and rewards. Storing
+  // per-sample slices instead meant a full extra copy of the batch here and
+  // another in train() to concatenate them back — 150MB of copying per batch
+  // at batchSize 1024, for data that arrives contiguous already.
+  store(states, actions, rewards) {
+    this.memory = { states, actions, rewards, count: actions.length };
   }
 
   // Trains critic on returns, then actor on advantage-positive samples.
   // Returns the critic loss (or null if nothing to train on).
   async train() {
-    if (this.memory.length === 0) return null;
-    const batchSize = this.memory.length;
+    if (!this.memory) return null;
+    const { states, actions, rewards, count: batchSize } = this.memory;
 
-    const fs = this.frameSize;
-    const stateData = new Float32Array(batchSize * fs);
-    for (let i = 0; i < batchSize; i++)
-      stateData.set(this.memory[i].state, i * fs);
-    const stateTensor = tf.tensor(stateData, [
+    const stateTensor = tf.tensor(states, [
       batchSize,
       this.visionH,
       this.visionW,
       this.channels
     ]);
-    const actionTensor = tf.tensor2d(
-      this.memory.map((m) => m.action),
-      [batchSize, 3]
-    );
-    const rewardTensor = tf.tensor2d(
-      this.memory.map((m) => m.reward),
-      [batchSize, 1]
-    );
+    const actionTensor = tf.tensor2d(actions, [batchSize, 3]);
+    const rewardTensor = tf.tensor2d(rewards, [batchSize, 1]);
 
     const criticHistory = await this.critic.fit(stateTensor, rewardTensor, {
       epochs: 1,
@@ -385,7 +422,7 @@ class CNNAgent {
     values.dispose();
     advantages.dispose();
     weightTensor.dispose();
-    this.memory = [];
+    this.memory = null;
     return loss;
   }
 
@@ -503,6 +540,11 @@ class PhysicsWorld {
     // is court-only), so sweep-and-prune's sorted-axis pruning is a pure win.
     this.world.broadphase = new CANNON.SAPBroadphase(this.world);
     this.world.solver.iterations = 10;
+    // Finished balls stay on the court until the next batch spawns. Ball.retire
+    // sleeps them, and cannon-es skips both integration and broadphase pairs
+    // for sleeping bodies — so as a batch plays out its physics cost drains
+    // away instead of staying at batchSize until the last shot lands.
+    this.world.allowSleep = true;
 
     this.concrete = new CANNON.Material("concrete");
     this.plastic = new CANNON.Material("plastic");
@@ -675,19 +717,87 @@ class Court {
   }
 }
 
-class Ball {
-  constructor(id, scene, physics, assets, radius) {
-    this.id = id;
-    this.mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(radius, 16, 16),
-      assets.batchBall
+// Every ball in the batch is on screen at once, so the batch is drawn as one
+// InstancedMesh: a single draw call (plus one per shadow map) for the whole
+// batch instead of one per ball. A Mesh per ball put the batch through the
+// draw-call path batchSize times per pass, and with two shadow-casting lights
+// there are three passes — so the cost of the thing this demo most wants to
+// scale up grew with exactly the number it wants to make large. Instanced, the
+// entire scene renders in 19 draw calls at batchSize 1024.
+//
+// Instances are hidden by zero-scaling them rather than by a visible flag,
+// which instancing has no per-instance equivalent of.
+class BallField {
+  constructor(scene, assets, radius, count) {
+    this.mesh = new THREE.InstancedMesh(
+      new THREE.SphereGeometry(radius, 12, 12),
+      assets.batchBall,
+      count
     );
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.mesh.castShadow = true;
-    // Dormant until spawn(). Without this the mesh defaults to visible at the
-    // origin, so the whole batch would clump at center court until training
-    // first spawns them.
-    this.mesh.visible = false;
+    // Instances move every frame and the mesh's bounding sphere is computed
+    // once from the initial matrices, so culling against it would pop the
+    // whole batch out of view. One field, always drawn.
+    this.mesh.frustumCulled = false;
+    this.tint = assets.ballTint;
+    this._xf = new THREE.Object3D();
+    this._matrixDirty = false;
+    this._colorDirty = false;
+
+    // Dormant until the first spawn(). Without this every instance defaults to
+    // an identity matrix, so the whole batch would clump at center court until
+    // training first spawns them.
+    const zero = new THREE.Matrix4().makeScale(0, 0, 0);
+    for (let i = 0; i < count; i++) {
+      this.mesh.setMatrixAt(i, zero);
+      this.mesh.setColorAt(i, this.tint.live);
+    }
     scene.add(this.mesh);
+  }
+
+  setTransform(i, position, quaternion) {
+    const xf = this._xf;
+    xf.position.copy(position);
+    xf.quaternion.copy(quaternion);
+    xf.scale.set(1, 1, 1);
+    xf.updateMatrix();
+    this.mesh.setMatrixAt(i, xf.matrix);
+    this._matrixDirty = true;
+  }
+
+  setLive(i, live) {
+    this.mesh.setColorAt(i, live ? this.tint.live : this.tint.spent);
+    this._colorDirty = true;
+  }
+
+  setVisible(on) {
+    this.mesh.visible = on;
+  }
+
+  // Instance buffers are uploaded once per frame, not once per ball — and not
+  // at all on frames where no ball moved, which is every frame between the
+  // last shot landing and the next batch spawning.
+  flush() {
+    if (this._matrixDirty) {
+      this.mesh.instanceMatrix.needsUpdate = true;
+      this._matrixDirty = false;
+    }
+    if (this._colorDirty) {
+      this.mesh.instanceColor.needsUpdate = true;
+      this._colorDirty = false;
+    }
+  }
+}
+
+class Ball {
+  constructor(id, field, physics, radius) {
+    this.id = id;
+    this.field = field;
+    // Instance transform, mirrored here because the instance matrix is
+    // write-only as far as the rest of the app is concerned.
+    this.position = new THREE.Vector3();
+    this.quaternion = new THREE.Quaternion();
 
     this.body = new CANNON.Body({
       mass: 2,
@@ -705,7 +815,6 @@ class Ball {
 
   _resetState() {
     this.active = false;
-    this.startPixels = null;
     this.action = [0, 0, 0];
     this.path = [];
     this.minDist = 100;
@@ -723,23 +832,34 @@ class Ball {
     this.body.velocity.set(0, 0, 0);
     this.body.angularVelocity.set(0, 0, 0);
     this.body.sleep();
-    this.mesh.position.copy(this.body.position);
-    this.mesh.quaternion.copy(this.body.quaternion);
 
     this._resetState();
     this.active = true;
-    this.mesh.visible = true;
+    this.syncMesh();
+    this.field.setLive(this.id, true);
   }
 
   syncMesh() {
-    this.mesh.position.copy(this.body.position);
-    this.mesh.quaternion.copy(this.body.quaternion);
+    this.position.copy(this.body.position);
+    this.quaternion.copy(this.body.quaternion);
+    this.field.setTransform(this.id, this.position, this.quaternion);
+  }
+
+  // The shot is over. The ball keeps its landing spot on the court until the
+  // next batch spawns — it just stops being simulated and dims. Sleeping the
+  // body is what freezes it: cannon-es skips integration and broadphase for
+  // sleeping bodies, so a finished ball costs nothing while the rest of the
+  // batch is still in the air.
+  retire() {
+    this.active = false;
+    this.body.sleep();
+    this.field.setLive(this.id, false);
   }
 
   // Apply the launch impulse derived from the agent's 3-vector action.
   launch(action, hoopPos) {
     this.action = action;
-    const start = this.mesh.position.clone();
+    const start = this.position.clone();
     const dirToHoop = new THREE.Vector3().subVectors(hoopPos, start);
     dirToHoop.y = 0;
     dirToHoop.normalize();
@@ -780,14 +900,28 @@ class VisionSystem {
     this.frameSize = W * H * 2;
 
     // Atlas layout. Each ball's per-eye WxH view is a tile in a cols x rows
-    // grid packed into ONE render target per eye. This is the whole point of
-    // the rework: the old path did two synchronous readRenderTargetPixels()
-    // readbacks per ball (2 * batchSize GPU->CPU pipeline flushes per batch),
-    // which was the dominant per-batch stall. Rendering into a shared atlas
-    // lets a single readback per eye cover the entire batch — 2 flushes total,
-    // independent of batchSize.
-    this.cols = Math.ceil(Math.sqrt(batchSize));
-    this.rows = Math.ceil(batchSize / this.cols);
+    // grid packed into ONE render target per eye, so a single readback per eye
+    // covers many balls at once. The alternative — two synchronous
+    // readRenderTargetPixels() per ball — was 2 * batchSize GPU->CPU pipeline
+    // flushes per batch and the dominant per-batch stall.
+    //
+    // The atlas is capped at CONFIG.maxAtlasDim rather than sized to hold the
+    // whole batch. Sizing it to batchSize made GPU memory scale with the one
+    // number this demo wants to push: a 1024-ball atlas at 256px/eye is
+    // 8192x8192, i.e. 256MB per eye of render target plus the same again in
+    // readback buffers, and past MAX_TEXTURE_SIZE on a lot of hardware. A
+    // capped atlas is filled and read back as many times as it takes
+    // (this.passes), which costs a few extra flushes per batch and makes the
+    // footprint independent of batchSize.
+    const maxCols = Math.floor(CONFIG.maxAtlasDim / W);
+    const maxRows = Math.floor(CONFIG.maxAtlasDim / H);
+    this.cols = Math.max(1, Math.min(Math.ceil(Math.sqrt(batchSize)), maxCols));
+    this.rows = Math.max(
+      1,
+      Math.min(Math.ceil(batchSize / this.cols), maxRows)
+    );
+    this.tilesPerPass = this.cols * this.rows;
+    this.passes = Math.ceil(batchSize / this.tilesPerPass);
     const atlasW = this.cols * W;
     const atlasH = this.rows * H;
     this.atlasW = atlasW;
@@ -818,34 +952,79 @@ class VisionSystem {
   // channels into one flat Float32Array [balls.length * frameSize]. The output
   // packing order is identical to the old per-target path, so downstream
   // consumers (agent state storage, drawAgentView) are unaffected.
-  captureBatch(balls, hoopPos, court, manualMesh, trajectoryGroup) {
-    const { W, H, frameSize, cols, atlasW } = this;
-    const batch = new Float32Array(balls.length * frameSize);
+  captureBatch({
+    balls,
+    ballField,
+    hoopPos,
+    court,
+    manualMesh,
+    trajectoryGroup
+  }) {
+    const { tilesPerPass } = this;
+    const batch = new Float32Array(balls.length * this.frameSize);
 
-    // Hide everything that shouldn't appear in the agents' vision.
+    // Hide everything that shouldn't appear in the agents' vision. The whole
+    // batch is one instanced mesh, so hiding the balls is a single flag.
     const wasVizVisible = trajectoryGroup.visible;
+    const wasFieldVisible = ballField.visible;
     trajectoryGroup.visible = false;
     manualMesh.visible = false;
-    for (const b of balls) b.mesh.visible = false;
+    ballField.visible = false;
     court.setHighContrast(true);
 
-    const half = CONFIG.ipd / 2;
-    for (let i = 0; i < balls.length; i++) {
-      const pos = balls[i].mesh.position;
-      const dir = new THREE.Vector3().subVectors(hoopPos, pos).normalize();
-      const rightVec = new THREE.Vector3().crossVectors(dir, UP).normalize();
+    // Freeze the shadow maps for the duration of the capture. Every render()
+    // redraws them by default, and the capture issues 2 * batchSize renders —
+    // 2048 full shadow passes over a scene that does not move, since the balls
+    // are hidden and the court is static throughout. autoUpdate = false with
+    // needsUpdate = true refreshes them exactly once, on the first render
+    // below, so the agents see shadows consistent with the high-contrast scene
+    // they're being shown rather than 2047 redundant redraws of it.
+    const wasAutoUpdate = this.renderer.shadowMap.autoUpdate;
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = true;
 
-      this.camLeft.position
-        .copy(pos)
-        .sub(rightVec.clone().multiplyScalar(half));
-      this.camRight.position
-        .copy(pos)
-        .add(rightVec.clone().multiplyScalar(half));
+    for (let start = 0; start < balls.length; start += tilesPerPass) {
+      const end = Math.min(start + tilesPerPass, balls.length);
+      this._renderPass(balls, start, end, hoopPos);
+      this._readPass(batch, start, end);
+    }
+
+    // Restore.
+    this.renderer.shadowMap.autoUpdate = wasAutoUpdate;
+    this.renderer.shadowMap.needsUpdate = true;
+    court.setHighContrast(false);
+    trajectoryGroup.visible = wasVizVisible;
+    ballField.visible = wasFieldVisible;
+    manualMesh.visible = true;
+    // Unbinding restores the canvas viewport/scissor from the renderer globals,
+    // which this path never touches, so there is nothing else to put back.
+    this.renderer.setRenderTarget(null);
+
+    return batch;
+  }
+
+  // Fills both atlases with the stereo views of balls[start, end).
+  _renderPass(balls, start, end, hoopPos) {
+    const { W, H, cols } = this;
+    const half = CONFIG.ipd / 2;
+    const dir = new THREE.Vector3();
+    const rightVec = new THREE.Vector3();
+    const offset = new THREE.Vector3();
+
+    for (let i = start; i < end; i++) {
+      const pos = balls[i].position;
+      dir.subVectors(hoopPos, pos).normalize();
+      rightVec.crossVectors(dir, UP).normalize();
+      offset.copy(rightVec).multiplyScalar(half);
+
+      this.camLeft.position.copy(pos).sub(offset);
+      this.camRight.position.copy(pos).add(offset);
       this.camLeft.lookAt(hoopPos);
       this.camRight.lookAt(hoopPos);
 
-      const tileX = (i % cols) * W;
-      const tileY = Math.floor(i / cols) * H;
+      const tile = i - start;
+      const tileX = (tile % cols) * W;
+      const tileY = Math.floor(tile / cols) * H;
 
       // Confine each ball's render to its own tile. The scissor test keeps both
       // the background clear and the draw inside the tile, so neighbouring tiles
@@ -862,14 +1041,19 @@ class VisionSystem {
       this.renderer.setRenderTarget(this.rtRight);
       this.renderer.render(this.scene, this.camRight);
     }
+  }
 
-    // One readback per eye covers every tile in the batch.
+  // Reads both atlases back and unpacks the tiles for balls[start, end) into
+  // the flat batch array. One readback per eye covers the whole pass.
+  _readPass(batch, start, end) {
+    const { W, H, cols, atlasW, atlasH, frameSize } = this;
+
     this.renderer.readRenderTargetPixels(
       this.rtLeft,
       0,
       0,
       atlasW,
-      this.atlasH,
+      atlasH,
       this.bufLeft
     );
     this.renderer.readRenderTargetPixels(
@@ -877,13 +1061,14 @@ class VisionSystem {
       0,
       0,
       atlasW,
-      this.atlasH,
+      atlasH,
       this.bufRight
     );
 
-    for (let i = 0; i < balls.length; i++) {
-      const tileX = (i % cols) * W;
-      const tileY = Math.floor(i / cols) * H;
+    for (let i = start; i < end; i++) {
+      const tile = i - start;
+      const tileX = (tile % cols) * W;
+      const tileY = Math.floor(tile / cols) * H;
       const offset = i * frameSize;
       for (let y = 0; y < H; y++) {
         for (let x = 0; x < W; x++) {
@@ -904,17 +1089,6 @@ class VisionSystem {
         }
       }
     }
-
-    // Restore.
-    court.setHighContrast(false);
-    trajectoryGroup.visible = wasVizVisible;
-    for (const b of balls) b.mesh.visible = true;
-    manualMesh.visible = true;
-    // Unbinding restores the canvas viewport/scissor from the renderer globals,
-    // which this path never touches, so there is nothing else to put back.
-    this.renderer.setRenderTarget(null);
-
-    return batch;
   }
 }
 
@@ -1229,13 +1403,26 @@ class TrainingArena {
     this.hoopPos = court.rimPosition;
     this.hoopPosCannon = court.rimPositionCannon;
 
+    this.field = new BallField(
+      scene,
+      assets,
+      CONFIG.ballRadius,
+      CONFIG.batchSize
+    );
     this.balls = [];
     this.bodyToBall = new Map();
     for (let i = 0; i < CONFIG.batchSize; i++) {
-      const b = new Ball(i, scene, physics, assets, CONFIG.ballRadius);
+      const b = new Ball(i, this.field, physics, CONFIG.ballRadius);
       this.balls.push(b);
       this.bodyToBall.set(b.body, b);
     }
+
+    // The current batch's stereo frames: one contiguous Float32Array holding
+    // every ball's launch view, in ball order, handed to the agent as-is at the
+    // end of the batch. Keeping per-ball copies of the same pixels cost a
+    // second full copy of the batch here and a third in the training path,
+    // which is 150MB of pointless copying per batch at batchSize 1024.
+    this.batchPixels = null;
 
     this.episodeStats = { count: 0, baskets: 0, shots: 0 };
     this.accuracyHistory = [];
@@ -1245,31 +1432,41 @@ class TrainingArena {
 
   // Position all balls but don't launch (initial state / warm-up).
   spawnAll() {
+    this.field.setVisible(true);
     for (const b of this.balls) b.spawn();
+    this.field.flush();
     this.dashboard.setBatchProgress("Simulating...");
+  }
+
+  // Leaving training mode. Retire whatever is still in the air so 1024 bodies
+  // aren't simulated invisibly, and take the batch off the court so manual
+  // mode gets a clean floor instead of the last batch's landing scatter.
+  halt() {
+    for (const b of this.balls) if (b.active) b.retire();
+    this.field.setVisible(false);
   }
 
   // Spawn, capture vision, predict, and launch a fresh batch.
   resetBatch(manualMesh) {
     this.spawnAll();
 
-    const batch = this.vision.captureBatch(
-      this.balls,
-      this.hoopPos,
-      this.court,
+    const batch = this.vision.captureBatch({
+      balls: this.balls,
+      ballField: this.field.mesh,
+      hoopPos: this.hoopPos,
+      court: this.court,
       manualMesh,
-      this.trajectory.group
-    );
+      trajectoryGroup: this.trajectory.group
+    });
+    this.batchPixels = batch;
     const actions = this.agent.predictBatch(batch, this.exploreNoise);
-    const fs = this.vision.frameSize;
-    for (let i = 0; i < this.balls.length; i++) {
-      const b = this.balls[i];
-      b.startPixels = batch.slice(i * fs, (i + 1) * fs);
-      b.launch(actions[i], this.hoopPos);
-    }
+    for (let i = 0; i < this.balls.length; i++)
+      this.balls[i].launch(actions[i], this.hoopPos);
+    this.field.flush();
 
+    // Ball 0 stands in for the batch in the activation panel.
     this.dashboard.visualizeActivations(
-      this.agent.getActivations(this.balls[0].startPixels)
+      this.agent.getActivations(batch.slice(0, this.vision.frameSize))
     );
     this.dashboard.visualizeKernels(this.agent);
     this.dashboard.drawAgentView(batch);
@@ -1284,7 +1481,7 @@ class TrainingArena {
         continue;
       }
       b.syncMesh();
-      b.path.push(b.mesh.position.clone());
+      b.path.push(b.position.clone());
 
       const dist = b.body.position.distanceTo(this.hoopPosCannon);
       if (dist < b.minDist) b.minDist = dist;
@@ -1309,10 +1506,11 @@ class TrainingArena {
         (isStopped && b.path.length > 10) ||
         isTimeout
       ) {
-        b.active = false;
-        b.mesh.visible = false;
+        b.retire();
       }
     }
+    // One instance-buffer upload per frame covers every ball that moved.
+    this.field.flush();
     return finished;
   }
 
@@ -1340,17 +1538,23 @@ class TrainingArena {
     if (this.isTrainingStep) return;
     this.isTrainingStep = true;
 
+    const actions = [];
+    const rewards = [];
     for (const b of this.balls) {
       const { reward, type } = this._reward(b);
       if (b.scored) this.episodeStats.baskets++;
       this.trajectory.add(b.path, type, reward);
-      this.agent.store(b.startPixels, b.action, reward);
+      actions.push(b.action);
+      rewards.push(reward);
       this.episodeStats.shots++;
       this.episodeStats.count++;
       this.accuracyHistory.push(b.scored ? 1 : 0);
       if (this.accuracyHistory.length > CONFIG.accuracyWindow)
         this.accuracyHistory.shift();
     }
+    // The states are already contiguous and in ball order in batchPixels, so
+    // the agent takes the whole array by reference instead of rebuilding it.
+    this.agent.store(this.batchPixels, actions, rewards);
 
     const rollingAcc =
       this.accuracyHistory.length > 0
@@ -1660,8 +1864,9 @@ class App {
       btnTrain.classList.toggle("active");
       this.manual.setEnabled(!this.trainingMode);
       this.manual.reset();
-      if (this.trainingMode && this.arena)
-        this.arena.resetBatch(this.manual.mesh);
+      if (!this.arena) return;
+      if (this.trainingMode) this.arena.resetBatch(this.manual.mesh);
+      else this.arena.halt();
     });
 
     btnExport.addEventListener("click", async () => {
