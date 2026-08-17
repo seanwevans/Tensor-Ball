@@ -683,11 +683,34 @@ class Court {
     pole.position.set(baseX + sign * 6, 6, 0);
     group.add(pole);
 
+    // The backboard is a solid slab rather than the 0.1ft sheet of glass it
+    // used to be, because at 0.1ft the balls went straight through it.
+    //
+    // cannon steps at a fixed 1/60s and actions are clamped to [-1, 1], so a
+    // ball leaves the launcher at up to 51ft/s — 0.85ft of travel per step. A
+    // sphere is only stopped if some step samples it before its center passes
+    // the box's midplane; past that, the narrowphase finds the *back* face
+    // closest and resolves the overlap out the back. That budget is
+    // ballRadius + halfDepth, i.e. 0.45ft for real glass, so a hard shot can
+    // clear the whole board between two samples: swept over every reachable
+    // impact speed, phase and spot on the face, 14% of head-on shots passed
+    // through. At halfDepth 0.6 the budget is 1.0ft against 0.85ft of travel
+    // and nothing gets through.
+    //
+    // The mesh is built from the same numbers as the body so the board that is
+    // drawn is exactly the board that collides — thickening only the physics
+    // box would trade shots through the glass for shots bouncing off thin air
+    // behind it. Only the back of the board moves: the court-facing face stays
+    // where it was, so bank shots play exactly as before.
+    const boardHalfDepth = 0.6;
+    const boardFaceX = boardX - sign * 0.05;
+    const boardCenterX = boardFaceX + sign * boardHalfDepth;
+
     const board = new THREE.Mesh(
-      new THREE.BoxGeometry(0.1, 3.5, 6),
+      new THREE.BoxGeometry(boardHalfDepth * 2, 3.5, 6),
       this.assets.glass
     );
-    board.position.set(boardX, 10.75, 0);
+    board.position.set(boardCenterX, 10.75, 0);
     group.add(board);
 
     const rim = new THREE.Mesh(
@@ -708,10 +731,10 @@ class Court {
     this.physics.add(poleBody);
 
     const boardBody = this._staticBody(
-      boardX,
+      boardCenterX,
       10.75,
       0,
-      new CANNON.Box(new CANNON.Vec3(0.05, 1.75, 3))
+      new CANNON.Box(new CANNON.Vec3(boardHalfDepth, 1.75, 3))
     );
     this.physics.add(boardBody);
     if (!isLeft) this.backboardBody = boardBody;
