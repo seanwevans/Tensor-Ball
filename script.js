@@ -47,6 +47,15 @@ const CONFIG = {
   exploreNoiseDecay: 0.999,
   advantageTemp: 1.0,
   advantageClip: 20.0,
+  // Passes the critic makes over the batch it just collected. The critic is
+  // what turns a reward into an advantage, so an underfit critic hands the
+  // actor something close to "reward minus batch mean" and the imitation
+  // weights stop depending on the state at all.
+  criticEpochs: 1,
+  // Minibatch for the actor's weighted-regression pass. The batch is walked
+  // once either way, so this trades the size of each Adam step against how many
+  // of them a batch buys.
+  actorMinibatch: 32,
   ipd: 0.2067,
   visionFov: 60,
   groups: { court: 1, ball: 2 },
@@ -103,6 +112,30 @@ class Assets {
     this.glass = new THREE.MeshPhysicalMaterial({
       color: 0xffffff,
       transmission: 0.1,
+      transparent: true,
+      opacity: 0.9,
+      roughness: 0.0,
+      metalness: 0.1,
+      reflectivity: 1.0,
+      clearcoat: 1.0
+    });
+    // The same backboard, minus refraction, for the agents' capture pass.
+    //
+    // A material with transmission > 0 anywhere in the render list makes
+    // WebGLRenderer run renderTransmissionPass() on every render(): the opaque
+    // scene is drawn again into a 1024x1024 (multisampled, mipmapped) target so
+    // the refraction shader has something to sample. That is a fixed ~1MP of
+    // extra work per render, and vision capture issues two renders per ball —
+    // 2048 of them per batch at batchSize 1024 — each for a 96x96 tile. The
+    // backboard's refraction was therefore costing more than the entire rest of
+    // training: measured under SwiftShader it was 160ms per view against 1.0ms
+    // with this material swapped in, a 160x difference in capture time, for a
+    // mean change of 0.002 in the grayscale the agent actually receives.
+    //
+    // The player's view still gets the refracting board — that is one render
+    // per frame, not two per ball.
+    this.glassCapture = new THREE.MeshPhysicalMaterial({
+      color: 0xffffff,
       transparent: true,
       opacity: 0.9,
       roughness: 0.0,
@@ -395,10 +428,13 @@ class CNNAgent {
     const rewardTensor = tf.tensor2d(rewards, [batchSize, 1]);
 
     const criticHistory = await this.critic.fit(stateTensor, rewardTensor, {
-      epochs: 1,
+      epochs: CONFIG.criticEpochs,
       verbose: 0
     });
-    const loss = criticHistory.history.loss ? criticHistory.history.loss[0] : 0;
+    // Report the last epoch's loss, so the number on the dashboard is the
+    // critic's error after the update however many passes it took.
+    const losses = criticHistory.history.loss;
+    const loss = losses && losses.length ? losses[losses.length - 1] : 0;
 
     // Actor: regress toward the actions taken, weighted by how far each beat
     // the critic's value estimate.
@@ -460,9 +496,9 @@ class CNNAgent {
   // cannot do this: passing sampleWeight throws "Support sampleWeight is not
   // implemented yet" in tfjs 4.x, so the update is driven explicitly. Minibatch
   // size matches fit()'s default of 32 so the number of optimizer steps per
-  // batch is unchanged. Only trainableWeights are passed to minimize(), which
-  // already excludes the two frozen conv layers.
-  _fitActorWeighted(states, actions, weights, minibatch = 32) {
+  // batch is unchanged (CONFIG.actorMinibatch retunes it). Only trainableWeights
+  // are passed to minimize(), which already excludes the two frozen conv layers.
+  _fitActorWeighted(states, actions, weights, minibatch = CONFIG.actorMinibatch) {
     const n = states.shape[0];
     const order = new Int32Array(n);
     for (let i = 0; i < n; i++) order[i] = i;
@@ -621,6 +657,10 @@ class Court {
     this.rimBody = null;
     this.backboardBody = null;
     this.scoringSensor = null;
+    // Both boards, because the transmission pass is triggered by anything
+    // transmissive in the render list — swapping only the near one would leave
+    // the cost in place.
+    this.boardMeshes = [];
 
     this._buildFloor();
 
@@ -712,6 +752,7 @@ class Court {
     );
     board.position.set(boardCenterX, 10.75, 0);
     group.add(board);
+    this.boardMeshes.push(board);
 
     const rim = new THREE.Mesh(
       new THREE.TorusGeometry(0.75, 0.05, 16, 100),
@@ -764,9 +805,15 @@ class Court {
     return group;
   }
 
-  setHighContrast(on) {
+  // Switch the court between the way the player sees it and the way the agents
+  // are shown it during vision capture: a flat white rim so the target reads
+  // clearly at 96px, and a backboard that doesn't drag a full-screen refraction
+  // pass through every one of the batch's renders (see Assets.glassCapture).
+  setCaptureMode(on) {
     if (this.rimMesh)
       this.rimMesh.material = on ? this.assets.highContrast : this.assets.rim;
+    for (const board of this.boardMeshes)
+      board.material = on ? this.assets.glassCapture : this.assets.glass;
   }
 }
 
@@ -1047,7 +1094,7 @@ class VisionSystem {
     trajectoryGroup.visible = false;
     manualMesh.visible = false;
     ballField.visible = false;
-    court.setHighContrast(true);
+    court.setCaptureMode(true);
 
     // Freeze the shadow maps for the duration of the capture. Every render()
     // redraws them by default, and the capture issues 2 * batchSize renders —
@@ -1069,7 +1116,7 @@ class VisionSystem {
     // Restore.
     this.renderer.shadowMap.autoUpdate = wasAutoUpdate;
     this.renderer.shadowMap.needsUpdate = true;
-    court.setHighContrast(false);
+    court.setCaptureMode(false);
     trajectoryGroup.visible = wasVizVisible;
     ballField.visible = wasFieldVisible;
     manualMesh.visible = true;
