@@ -74,11 +74,23 @@ async function main() {
       return JSON.parse(await readFile(file, "utf8"));
     }
     const t = Date.now();
+    const log = [];
     const result = await runTrial({
       config: job.config,
       seed: job.seed,
       batches: opts.batches,
-      budgetMs: opts.minutes * 60000
+      budgetMs: opts.minutes * 60000,
+      // A trial is minutes long; without a running trace a stalled stage looks
+      // exactly like a slow one.
+      onBatch: (r) => {
+        log.push(
+          `batch ${String(r.batch).padStart(3)}  acc ${(r.acc * 100).toFixed(2)}%  ` +
+            `reward ${r.meanReward.toFixed(2)}  d10 ${r.distP10.toFixed(2)}  ` +
+            `loss ${r.loss == null ? "--" : r.loss.toFixed(1)}  ` +
+            `${((r.simMs + r.stepMs) / 1000).toFixed(1)}s`
+        );
+        writeFile(join(outDir, `${job.name}.s${job.seed}.progress`), log.join("\n")).catch(() => {});
+      }
     });
     const record = { name: job.name, ...result };
     await writeFile(file, JSON.stringify(record, null, 2));

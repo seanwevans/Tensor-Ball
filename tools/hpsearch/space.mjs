@@ -51,6 +51,39 @@ export const stages = {
     { name: "score-hi", set: { reward: { score: 100 } } }
   ],
 
-  combo: [],
+  // Stage 1 said the exploration schedule dominates everything else, and that
+  // the shipped one is far too hot for far too long: exploreNoise 0.4 decaying
+  // at 0.999/batch barely moves inside a run, and every config that cut the
+  // noise beat every config that didn't. Decaying it at 0.93 instead — 0.4 down
+  // to the 0.15 floor over ~14 batches — went from 1.1% to 9.6% accuracy while
+  // the shipped defaults reached 2.5%.
+  //
+  // So stage 2 re-centres on that schedule (D = exploreNoiseDecay 0.93) and asks
+  // the remaining questions from there. Testing the reward shape or the critic
+  // on top of the shipped noise would have been measuring them through a policy
+  // that exploration was drowning anyway.
+  combo: [
+    { name: "d-base", set: { exploreNoiseDecay: 0.93 } },
+
+    // Anneal harder, and further.
+    { name: "d-vfast", set: { exploreNoiseDecay: 0.85 } },
+    { name: "d-floor05", set: { exploreNoiseDecay: 0.93, exploreNoiseMin: 0.05 } },
+    // Stage 1's other winner was simply starting cold (0.2). Does starting cold
+    // still help once the schedule anneals, or was it the same finding twice?
+    { name: "d-lo", set: { exploreNoise: 0.2, exploreNoiseMin: 0.05, exploreNoiseDecay: 0.93 } },
+
+    // Advantage weighting: both directions beat baseline in stage 1.
+    { name: "d-clip", set: { exploreNoiseDecay: 0.93, advantageClip: 100 } },
+    { name: "d-temp-clip", set: { exploreNoiseDecay: 0.93, advantageTemp: 0.5, advantageClip: 100 } },
+
+    // A better-fit critic, which costs real time per batch — see score.mjs on
+    // why that makes the batch-indexed half of the score generous to it.
+    { name: "d-critic2", set: { exploreNoiseDecay: 0.93, criticEpochs: 2 } },
+
+    // Reward shape, asked on top of a policy that is actually learning.
+    { name: "d-tight", set: { exploreNoiseDecay: 0.93, reward: { missDistanceScale: 5 } } },
+    { name: "d-bonus", set: { exploreNoiseDecay: 0.93, reward: { rim: 6, backboard: 2 } } }
+  ],
+
   final: []
 };
