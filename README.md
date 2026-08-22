@@ -16,7 +16,8 @@ the critic learns the cloud pulls in toward the rim.
 Each ball carries a pair of stereo cameras pointed at the rim. Every training
 batch, the agent renders each ball's view, feeds the two grayscale images through
 a small convolutional network, and outputs a 3-vector launch action (vertical
-power, forward power, aim adjustment). The ball is launched, the physics play
+power, forward power, aim adjustment) — `CONFIG.launch` is the envelope in ft/s
+that vector is stretched onto. The ball is launched, the physics play
 out, and the shot's outcome becomes the reward. The agent learns from vision
 alone — it is never told where the hoop is.
 
