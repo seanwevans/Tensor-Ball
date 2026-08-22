@@ -59,6 +59,11 @@
     <div class="stat-row"><span>Batch:</span> <span id="batch-progress">0/32</span></div>
     <button id="toggle-train">START TRAINING</button>
     <button id="export-btn" style="background: #333; margin-top: 5px; border: 1px solid #555;">EXPORT POLICY</button>
+    <button id="import-btn" style="background: #333; margin-top: 5px; border: 1px solid #555;">IMPORT POLICY</button>
+    <!-- The export downloads two files (topology + weights), so the picker takes
+         both at once. Hidden and driven by the button above: a bare file input
+         cannot be styled to match the panel. -->
+    <input id="import-input" type="file" accept=".json,.bin" multiple hidden>
   </div>
 
   <div id="instructions">
