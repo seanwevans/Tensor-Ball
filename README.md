@@ -42,16 +42,20 @@ terminal reward, so there's no temporal credit assignment.
   best in the batch and shooting straight up through the net would be the
   easiest policy to learn.
 - **Exploration** — Gaussian-ish noise added to actions, annealed over training
-  so the agent explores widely early and exploits as it improves.
-- **Replay** — the highest-advantage shots are kept in a fixed-capacity buffer
-  (`CONFIG.replay`) and replayed into each actor update, so a made basket is
-  worth more than the single gradient step it used to get before being
-  discarded.
   so the agent explores widely early and exploits as it improves. A slice of
   each batch (`CONFIG.evalBalls`) is launched with the noise switched off, so
   the dashboard reports the policy's own accuracy next to the behaviour
   policy's — the two move independently, and only the first one is what the
   agent has learned.
+- **Replay** — the highest-advantage shots are kept in a fixed-capacity buffer
+  (`CONFIG.replay`) and replayed into each actor update, so a made basket is
+  worth more than the single gradient step it used to get before being
+  discarded.
+- **Curriculum** — balls spawn inside a radius of the rim that starts small and
+  grows, one-way, whenever the rolling accuracy clears a threshold
+  (`CONFIG.curriculum`). The far court is where shots are both hardest to hit
+  and hardest to range — stereo disparity is sub-pixel out there — so opening
+  it up is something the policy earns rather than something it starts with.
 
 The live dashboards show the agent's stereo input, the learned first-layer
 filters, dense-layer activations, the critic's batch loss, and running accuracy.

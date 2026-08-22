@@ -137,6 +137,10 @@
         distMed: quantile(dists, 0.5),
         loss: c.loss,
         noise,
+        // How far out the batch was spawned. Accuracy is only comparable
+        // between configs at the same radius, so a curriculum run has to
+        // report it alongside.
+        spawnRadius: this.spawnRadius,
         // Simulation of this batch's shots (between the previous finishBatch
         // and this one) vs. reward + train + next capture inside it.
         simMs: tStart - H.tPrev,
