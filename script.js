@@ -42,9 +42,31 @@ const CONFIG = {
   l2: 0.001,
   maxHistory: 100,
   accuracyWindow: 1024,
+  // The exploration schedule: uniform +/-exploreNoise/2 added to every action,
+  // shrunk by exploreNoiseDecay once per trained batch, floored at
+  // exploreNoiseMin.
+  //
+  // Both the rate and the floor were set too high to finish, and too high to
+  // live with once they did.
+  //
+  // The rate: at 0.999/batch the noise needs ~980 batches to fall from 0.4 to
+  // 0.15 — a million balls at the default batchSize. So for essentially any run
+  // anyone actually watches, the schedule may as well not exist; the agent
+  // shoots with a large fixed jitter throughout, which erases good shots about
+  // as fast as it finds them. 0.99 covers the same ground in ~230 batches.
+  //
+  // The floor: exploration noise is a hard ceiling on accuracy, because it is
+  // added to whatever the policy outputs and never goes away. Modelling the
+  // best action available to any policy under a fixed jitter — the action whose
+  // noise basin is fullest, over the spawn distribution — a floor of 0.15 caps
+  // accuracy near 56% against 85% at 0.05, on the launch envelope CONFIG.launch
+  // now defines. (On the wider envelope that preceded it the same two floors
+  // capped it at 34% and 66%; narrowing the envelope raised both ceilings but
+  // did not change which floor is worth having.) A floor exists to keep a
+  // little jitter alive, not to bound how good the policy may get.
   exploreNoise: 0.4,
-  exploreNoiseMin: 0.15,
-  exploreNoiseDecay: 0.999,
+  exploreNoiseMin: 0.04,
+  exploreNoiseDecay: 0.99,
   // Balls at the front of each batch launched with the exploration noise
   // switched off, so the dashboard can report what the policy actually does
   // rather than what the policy plus a deliberate mis-aim does.
