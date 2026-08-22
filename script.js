@@ -66,8 +66,8 @@ const CONFIG = {
   // spawns have a clean swish reachable.
   minSpawnDistance: 2.0,
   exploreNoise: 0.4,
-  exploreNoiseMin: 0.15,
-  exploreNoiseDecay: 0.999,
+  exploreNoiseMin: 0.04,
+  exploreNoiseDecay: 0.99,
   // Balls at the front of each batch launched with the exploration noise
   // switched off, so the dashboard can report what the policy actually does
   // rather than what the policy plus a deliberate mis-aim does.
