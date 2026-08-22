@@ -62,6 +62,13 @@ terminal reward, so there's no temporal credit assignment.
   and hardest to range — stereo disparity is sub-pixel out there — so opening
   it up is something the policy earns rather than something it starts with.
 
+The court carries the full NBA marking set at regulation dimensions — the
+three-point arc at 23.75ft from the middle of the ring with 22ft corners, a
+16ft lane, free-throw circles solid away from the basket and dashed inside the
+lane, restricted-area arcs, and the centre circles. All of it merges into one
+mesh, because vision capture renders the scene twice per ball and a draw call
+added to the court is one paid two thousand times a batch.
+
 The live dashboards show the agent's stereo input, the learned first-layer
 filters, dense-layer activations, the critic's batch loss, and running accuracy.
 

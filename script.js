@@ -1245,11 +1245,7 @@ class Court {
 
     this.group = new THREE.Group();
     scene.add(this.group);
-    this.group.add(this._line(94.17, 0.17, 0, -25));
-    this.group.add(this._line(94.17, 0.17, 0, 25));
-    this.group.add(this._line(0.17, 50, -47, 0));
-    this.group.add(this._line(0.17, 50, 47, 0));
-    this.group.add(this._line(0.17, 50, 0, 0));
+    this._buildMarkings();
 
     scene.add(this._buildHoop(true));
     scene.add(this._buildHoop(false));
@@ -1272,11 +1268,117 @@ class Court {
     this.physics.add(body);
   }
 
-  _line(w, h, x, z) {
-    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), this.assets.line);
-    m.rotation.x = -Math.PI / 2;
-    m.position.set(x, 0.02, z);
-    return m;
+  // NBA regulation markings, all of them, as a single mesh.
+  //
+  // The court was already built to the rulebook — 94x50, and CONFIG.rim.x of
+  // 41.75 is exactly the 4ft from the baseline to the backboard face plus the
+  // 15in from the face to the middle of the ring — so every number below is
+  // the real one rather than something eyeballed to fit.
+  //
+  // One mesh matters more here than it looks. VisionSystem renders the scene
+  // twice per ball, which is 2048 renders a batch at batchSize 1024, so a draw
+  // call added to the court is a draw call paid two thousand times before the
+  // batch has been trained on once. Merged, the full set of markings costs one
+  // — fewer than the five plain boundary lines it replaces.
+  _buildMarkings() {
+    const W = 0.17; // 2in stripe, the width the rulebook gives
+    const g = [];
+    const rect = (w, h, x, z) => {
+      const geom = new THREE.PlaneGeometry(w, h);
+      geom.rotateX(-Math.PI / 2);
+      geom.translate(x, 0.02, z);
+      g.push(geom);
+    };
+    // Angles are measured in the ring's own plane before it is laid flat, and
+    // that rotation sends local +y to world -z — so an arc drawn from thetaStart
+    // opens the way it reads here once it is on the floor.
+    const arc = (cx, cz, r, from, len, seg = 96) => {
+      const geom = new THREE.RingGeometry(r - W / 2, r + W / 2, seg, 1, from, len);
+      geom.rotateX(-Math.PI / 2);
+      geom.translate(cx, 0.02, cz);
+      g.push(geom);
+    };
+    const dashedArc = (cx, cz, r, from, len, dashes) => {
+      // Half stripe, half gap, which is what the far side of the free-throw
+      // circle looks like.
+      const step = len / (dashes * 2 - 1);
+      for (let i = 0; i < dashes; i++)
+        arc(cx, cz, r, from + i * 2 * step, step, 8);
+    };
+
+    // Boundary and half court.
+    rect(94.17, W, 0, -25);
+    rect(94.17, W, 0, 25);
+    rect(W, 50, -47, 0);
+    rect(W, 50, 47, 0);
+    rect(W, 50, 0, 0);
+    // Centre circle, and the 2ft one inside it.
+    arc(0, 0, 6, 0, Math.PI * 2);
+    arc(0, 0, 2, 0, Math.PI * 2);
+
+    for (const isLeft of [true, false]) {
+      const sign = isLeft ? -1 : 1;
+      const rimX = sign * CONFIG.rim.x;
+      const baseX = sign * 47;
+      // The half's markings all open toward centre court.
+      const facing = isLeft ? 0 : Math.PI;
+
+      // Free-throw lane: 16ft wide, baseline to the free-throw line. The line
+      // sits 15ft from the backboard face, which is 4ft in from the baseline.
+      const ftX = sign * 28;
+      rect(19, W, sign * 37.5, -8);
+      rect(19, W, sign * 37.5, 8);
+      rect(W, 16, ftX, 0);
+      // Free-throw circle. The half away from the basket is solid; the half
+      // inside the lane is dashed, which is the way round the rulebook has it.
+      arc(ftX, 0, 6, facing - Math.PI / 2, Math.PI);
+      dashedArc(ftX, 0, 6, facing + Math.PI / 2, Math.PI, 8);
+
+      // Three-point line. The arc is 23.75ft from the middle of the ring; the
+      // corners are straight, 22ft out — 3ft in from the sideline — and run
+      // back to the baseline from where they meet the arc.
+      const R3 = 23.75;
+      const CORNER = 22;
+      // Where arc meets corner, as a distance from the ring along the court.
+      const meet = Math.sqrt(R3 * R3 - CORNER * CORNER);
+      const meetX = rimX - sign * meet;
+      const half = Math.acos(meet / R3);
+      arc(rimX, 0, R3, facing - half, 2 * half);
+      const cornerLen = Math.abs(baseX - meetX);
+      for (const z of [-CORNER, CORNER])
+        rect(cornerLen, W, (baseX + meetX) / 2, z);
+
+      // Restricted area: 4ft from under the ring, closed off to the backboard.
+      arc(rimX, 0, 4, facing - Math.PI / 2, Math.PI);
+      const boardX = sign * 43;
+      for (const z of [-4, 4])
+        rect(Math.abs(boardX - rimX), W, (boardX + rimX) / 2, z);
+    }
+
+    this.group.add(new THREE.Mesh(Court._mergeFlat(g), this.assets.line));
+  }
+
+  // Concatenates flat geometries into one. Only positions are carried across:
+  // the markings are painted with an unlit MeshBasicMaterial, so normals and
+  // uvs would be bytes uploaded for nothing.
+  //
+  // Hand-rolled rather than pulled from examples/jsm/utils/BufferGeometryUtils
+  // — the merge these need is a concatenation of one attribute, and the app
+  // otherwise takes a single examples module.
+  static _mergeFlat(geometries) {
+    const flat = geometries.map((geom) => (geom.index ? geom.toNonIndexed() : geom));
+    let total = 0;
+    for (const geom of flat) total += geom.attributes.position.array.length;
+    const positions = new Float32Array(total);
+    let offset = 0;
+    for (const geom of flat) {
+      positions.set(geom.attributes.position.array, offset);
+      offset += geom.attributes.position.array.length;
+      geom.dispose();
+    }
+    const merged = new THREE.BufferGeometry();
+    merged.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    return merged;
   }
 
   _staticBody(x, y, z, shape) {
