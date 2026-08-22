@@ -45,6 +45,23 @@ const CONFIG = {
   exploreNoise: 0.4,
   exploreNoiseMin: 0.15,
   exploreNoiseDecay: 0.999,
+  // Balls at the front of each batch launched with the exploration noise
+  // switched off, so the dashboard can report what the policy actually does
+  // rather than what the policy plus a deliberate mis-aim does.
+  //
+  // Every other accuracy number in this app is measured on the behaviour
+  // policy: predictBatch adds up to +/-exploreNoise/2 to each action and the
+  // shot that gets graded is the perturbed one. That conflates two things
+  // that move independently — how good the policy is, and how much noise is
+  // being injected into it — and the second one is on a schedule. An agent
+  // improving while the noise floor holds it back looks exactly like an agent
+  // that has stopped learning.
+  //
+  // These balls are still stored and trained on: a greedy action with a good
+  // reward is the best imitation target in the batch, not a sample to discard.
+  // 128 of 1024 costs an eighth of the batch's exploration and gives the eval
+  // rate a large enough sample to be readable batch to batch.
+  evalBalls: 128,
   advantageTemp: 1.0,
   advantageClip: 20.0,
   // Passes the critic makes over the batch it just collected. The critic is
@@ -360,7 +377,14 @@ class CNNAgent {
   }
 
   // pixelDataBatch: Float32Array of size count * frameSize (frameSize = W*H*2).
-  predictBatch(pixelDataBatch, noiseScale = 0) {
+  //
+  // The first greedyCount actions are returned unperturbed. Those balls are the
+  // batch's eval sample (CONFIG.evalBalls): they measure the policy itself,
+  // while the rest carry the exploration noise that generates the batch's
+  // variety. Taking them off the front rather than at random keeps the split
+  // stable across batches, so the eval rate is a fixed sample of the state
+  // distribution rather than a fresh one every time.
+  predictBatch(pixelDataBatch, noiseScale = 0, greedyCount = 0) {
     return tf.tidy(() => {
       // Derive the batch count from the data length instead of assuming a fixed
       // batch size, so a partial or resized batch reshapes correctly.
@@ -378,10 +402,15 @@ class CNNAgent {
       const clamp = (v) => Math.max(-1, Math.min(1, v));
       const actions = [];
       for (let i = 0; i < count; i++) {
+        // Note the noise draw happens either way: multiplying by a zero scale
+        // rather than skipping the call keeps the RNG stream identical whatever
+        // greedyCount is, so a seeded run (tools/hpsearch) stays comparable to
+        // one with a different eval split.
+        const scale = i < greedyCount ? 0 : noiseScale;
         actions.push([
-          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale),
-          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale),
-          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale)
+          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * scale),
+          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * scale),
+          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * scale)
         ]);
       }
       return actions;
@@ -910,6 +939,11 @@ class Ball {
   constructor(id, field, physics, radius) {
     this.id = id;
     this.field = field;
+    // Balls at the front of the batch are the eval sample: launched greedily
+    // and graded separately (see CONFIG.evalBalls). Fixed by index rather than
+    // re-drawn each batch, and set here rather than in _resetState because it
+    // is a property of the slot, not of the shot.
+    this.isEval = id < CONFIG.evalBalls;
     // Instance transform, mirrored here because the instance matrix is
     // write-only as far as the rest of the app is concerned.
     this.position = new THREE.Vector3();
@@ -1292,6 +1326,7 @@ class Dashboard {
     this.uiBaskets = document.getElementById("baskets");
     this.uiIllegal = document.getElementById("illegal-entries");
     this.uiAcc = document.getElementById("accuracy");
+    this.uiEvalAcc = document.getElementById("eval-accuracy");
     this.uiStatus = document.getElementById("status");
     this.uiBatch = document.getElementById("batch-progress");
 
@@ -1312,8 +1347,13 @@ class Dashboard {
     if (this.uiBatch) this.uiBatch.innerText = text;
   }
 
-  setStats({ accuracy, baskets, episodes, illegalEntries }) {
+  setStats({ accuracy, evalAccuracy, baskets, episodes, illegalEntries }) {
     this.uiAcc.innerText = Math.round(accuracy * 100) + "%";
+    // Null until the first eval ball has been graded, and when a config turns
+    // the eval split off entirely.
+    if (this.uiEvalAcc)
+      this.uiEvalAcc.innerText =
+        evalAccuracy == null ? "--" : Math.round(evalAccuracy * 100) + "%";
     this.uiBaskets.innerText = baskets;
     this.uiEp.innerText = episodes;
     if (this.uiIllegal) this.uiIllegal.innerText = illegalEntries;
@@ -1558,8 +1598,16 @@ class TrainingArena {
     // which is 150MB of pointless copying per batch at batchSize 1024.
     this.batchPixels = null;
 
+    // Balls launched greedily each batch. Clamped to the batch so a config
+    // with evalBalls >= batchSize degrades to "the whole batch is eval" rather
+    // than silently leaving no ball exploring.
+    this.evalBalls = Math.min(CONFIG.evalBalls, CONFIG.batchSize);
+
     this.episodeStats = { count: 0, baskets: 0, shots: 0, illegal: 0 };
     this.accuracyHistory = [];
+    // Graded separately from accuracyHistory: same window, but only the shots
+    // the exploration noise never touched.
+    this.evalHistory = [];
     this.isTrainingStep = false;
     this.exploreNoise = CONFIG.exploreNoise;
   }
@@ -1593,7 +1641,11 @@ class TrainingArena {
       trajectoryGroup: this.trajectory.group
     });
     this.batchPixels = batch;
-    const actions = this.agent.predictBatch(batch, this.exploreNoise);
+    const actions = this.agent.predictBatch(
+      batch,
+      this.exploreNoise,
+      this.evalBalls
+    );
     for (let i = 0; i < this.balls.length; i++)
       this.balls[i].launch(actions[i], this.hoopPos);
     this.field.flush();
@@ -1693,18 +1745,28 @@ class TrainingArena {
       this.accuracyHistory.push(b.scored ? 1 : 0);
       if (this.accuracyHistory.length > CONFIG.accuracyWindow)
         this.accuracyHistory.shift();
+      if (b.isEval) {
+        this.evalHistory.push(b.scored ? 1 : 0);
+        // Scaled so the eval window spans the same number of batches as the
+        // behaviour window, not the same number of shots — otherwise the eval
+        // rate would average over eight times as much history and lag.
+        const evalWindow = Math.max(
+          1,
+          Math.round(
+            (CONFIG.accuracyWindow * this.evalBalls) / CONFIG.batchSize
+          )
+        );
+        if (this.evalHistory.length > evalWindow) this.evalHistory.shift();
+      }
     }
     // The states are already contiguous and in ball order in batchPixels, so
     // the agent takes the whole array by reference instead of rebuilding it.
     this.agent.store(this.batchPixels, actions, rewards);
 
-    const rollingAcc =
-      this.accuracyHistory.length > 0
-        ? this.accuracyHistory.reduce((a, b) => a + b, 0) /
-          this.accuracyHistory.length
-        : 0;
+    const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
     this.dashboard.setStats({
-      accuracy: rollingAcc,
+      accuracy: mean(this.accuracyHistory),
+      evalAccuracy: this.evalHistory.length ? mean(this.evalHistory) : null,
       baskets: this.episodeStats.baskets,
       episodes: this.episodeStats.count,
       illegalEntries: this.episodeStats.illegal
