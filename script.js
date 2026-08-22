@@ -1219,9 +1219,29 @@ class CNNAgent {
             const raw = this.actor.apply(xb, { training: true });
             const { mean, logStd, std } = this._headSplit(raw);
 
-            // Floor std in the precision term to prevent 1/sigma^2 gradient explosion
-            const safeStd = std.clipByValue(0.1, 1.0);
-            const z = yb.sub(mean).div(safeStd);
+            // Both terms see the same sigma. This is -log N(a | mean, std)
+            // dropping the constant 0.5*log(2*pi) per dimension, and the two
+            // halves only balance because they are the same distribution's:
+            // the log(sigma) term pushes the spread down, and the z^2 term
+            // pushes it up whenever the actions being fitted scatter wider
+            // than it, which is what gives sigma an equilibrium at the actual
+            // spread of the good actions.
+            //
+            // Flooring sigma in the z^2 term alone breaks that. Below the
+            // floor the quadratic has no gradient on sigma at all while
+            // log(sigma) keeps pulling down, so there is no equilibrium left
+            // under it — only a one-way ratchet to logStdMin. Measured: the
+            // policy's mean sigma fell to 0.020 by the ninth batch and stayed
+            // pinned there, against a run that dipped to 0.032 and recovered
+            // to 0.17. A policy that has stopped exploring stops generating
+            // the variety its own update is computed from.
+            //
+            // The precision term is bounded without the floor: _headSplit
+            // clips logStd to CONFIG.policy.logStdMin, so 1/sigma^2 cannot
+            // exceed 1/logStdMin^2. Raising that config value is the way to
+            // bound it harder, because it bounds the sampler and the loss
+            // together rather than putting them at odds.
+            const z = yb.sub(mean).div(std);
             const perSample = z.square().mul(0.5).add(logStd).sum(1);
 
             // Normalize by sum of positive weights rather than batch size
