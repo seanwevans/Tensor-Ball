@@ -20,11 +20,17 @@ export const stages = {
     // Width of the action jitter that generates the batch's variety. The actor
     // only ever imitates actions it already took, so this is the only source of
     // anything better than what it currently does.
-    { name: "noise-lo", set: { exploreNoise: 0.2, exploreNoiseMin: 0.08 } },
-    { name: "noise-hi", set: { exploreNoise: 0.8, exploreNoiseMin: 0.3 } },
-    { name: "noise-vhi", set: { exploreNoise: 1.4, exploreNoiseMin: 0.4 } },
-    // Default decay is 0.999/batch — over a run this short it may as well be 1.
-    { name: "decay-fast", set: { exploreNoiseDecay: 0.93 } },
+    //
+    // This is no longer a schedule: the policy is Gaussian and learns its own
+    // spread, so what is screenable is where it starts and how far it is
+    // allowed to travel (CONFIG.policy). The exploreNoise* entries that used to
+    // sit here are gone with the knobs; results/screen still holds their runs.
+    { name: "std-init-lo", set: { policy: { logStdInit: Math.log(0.1) } } },
+    { name: "std-init-hi", set: { policy: { logStdInit: Math.log(0.5) } } },
+    // Can the policy commit? A higher floor keeps it exploring whether or not
+    // it has earned the right to stop.
+    { name: "std-floor-hi", set: { policy: { logStdMin: Math.log(0.08) } } },
+    { name: "std-ceil-lo", set: { policy: { logStdMax: Math.log(0.4) } } },
 
     // How sharply the advantage weighting favours the batch's best shots.
     { name: "temp-sharp", set: { advantageTemp: 0.5 } },
@@ -51,6 +57,12 @@ export const stages = {
     { name: "score-hi", set: { reward: { score: 100 } } }
   ],
 
+  // NOTE: this stage was derived against the annealed-noise policy and is
+  // written entirely in terms of exploreNoiseDecay, a knob that no longer
+  // exists — the policy learns its own spread now. It needs re-deriving from a
+  // fresh stage 1 before it is run again; it is left here as the record of what
+  // was asked last time.
+  //
   // Stage 1 said the exploration schedule dominates everything else, and that
   // the shipped one is far too hot for far too long: exploreNoise 0.4 decaying
   // at 0.999/batch barely moves inside a run, and every config that cut the

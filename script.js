@@ -65,20 +65,52 @@ const CONFIG = {
   // available: sweeping the action space per distance band, 100% of 2-4ft
   // spawns have a clean swish reachable.
   minSpawnDistance: 2.0,
-  exploreNoise: 0.4,
-  exploreNoiseMin: 0.04,
-  exploreNoiseDecay: 0.99,
-  // Balls at the front of each batch launched with the exploration noise
-  // switched off, so the dashboard can report what the policy actually does
-  // rather than what the policy plus a deliberate mis-aim does.
+  // The policy is Gaussian and learns its own spread, so there is no
+  // exploration schedule to tune — exploreNoise / exploreNoiseMin /
+  // exploreNoiseDecay are gone. What replaces them:
+  //
+  // A global annealed noise is the wrong shape for this problem. It is one
+  // number for every state, so it cannot be small where the policy is good and
+  // large where it is not, and being on a schedule it stops shrinking whether
+  // or not the agent has earned it. The schedule this replaces has since been
+  // retuned — 0.99/batch to a floor of 0.04, rather than 0.999 to 0.15 — which
+  // fixes how long it takes to arrive but not its shape: it is still one number
+  // for every state, and it still stops moving on a fixed date. And a floor is
+  // still a hard ceiling, because it is added to whatever the policy outputs
+  // and never goes away. Modelling the best action available to any policy
+  // under a fixed jitter, on the current launch envelope, 0.15 caps accuracy
+  // near 56% and 0.04 near 70% — better, but still a bound the agent cannot
+  // argue with.
+  //
+  // So make the spread part of the policy. The actor emits a mean and a log
+  // standard deviation per action dimension, actions are sampled from that
+  // Gaussian, and the advantage-weighted objective becomes the likelihood of
+  // the action taken rather than a regression onto it. Sigma then shrinks by
+  // itself wherever the high-advantage actions cluster tightly, and stays wide
+  // wherever they do not — per state, on the agent's own evidence.
+  //
+  // logStdInit is exp()'d, so 0.25 starts the policy sampling about as widely
+  // as the old schedule's opening +/-0.2 uniform. logStdMin is the floor that
+  // keeps a collapsed policy still exploring; logStdMax stops a policy that is
+  // learning nothing from widening without bound.
+  policy: {
+    logStdInit: Math.log(0.25),
+    logStdMin: Math.log(0.02),
+    logStdMax: Math.log(0.8)
+  },
+  // Balls at the front of each batch launched on the policy's mean action
+  // rather than a draw from its distribution, so the dashboard can report what
+  // the policy actually does rather than what the policy plus its exploration
+  // does.
   //
   // Every other accuracy number in this app is measured on the behaviour
-  // policy: predictBatch adds up to +/-exploreNoise/2 to each action and the
-  // shot that gets graded is the perturbed one. That conflates two things
-  // that move independently — how good the policy is, and how much noise is
-  // being injected into it — and the second one is on a schedule. An agent
-  // improving while the noise floor holds it back looks exactly like an agent
-  // that has stopped learning.
+  // policy: predictBatch samples each action from N(mean, sigma) and the shot
+  // that gets graded is the sampled one. That conflates two things that move
+  // independently — how good the policy is, and how widely it is currently
+  // exploring. An agent improving while its spread holds it back looks exactly
+  // like an agent that has stopped learning, which is the whole reason the
+  // spread is now something the policy chooses rather than something a
+  // schedule imposes.
   //
   // These balls are still stored and trained on: a greedy action with a good
   // reward is the best imitation target in the batch, not a sample to discard.
@@ -568,16 +600,46 @@ class CNNAgent {
     // stable feature extractor.
     m.layers[0].trainable = false;
     m.layers[1].trainable = false;
-    m.add(tf.layers.dense({ units: 3, activation: "tanh" }));
-    // Compiled so the model stays serializable for EXPORT POLICY, but the actor
-    // is not trained through fit() — see _fitActorWeighted, which needs a
-    // per-sample weighted loss that fit() cannot express in this tfjs version.
+    // Six linear outputs, not three tanh ones: the first three are the mean of
+    // the action distribution (squashed by tanh in _headSplit, not here, so the
+    // second three stay unsquashed) and the last three are its log standard
+    // deviation. Keeping it a single sequential dense layer rather than two
+    // heads keeps the actor serializable through EXPORT POLICY.
+    m.add(tf.layers.dense({ units: 6 }));
     m.compile({
       optimizer: tf.train.adam(this.learningRate),
       loss: "meanSquaredError"
     });
+    // Start the spread at CONFIG.policy.logStdInit. The layer's bias is zeros
+    // by default, which would open at std 1 — a policy sampling almost
+    // uniformly across the whole action range, for as long as it took the
+    // gradient to pull the bias back down.
+    // setWeights assigns into the layer's existing variables, so everything
+    // created here is disposable once it returns.
+    tf.tidy(() => {
+      const head = m.layers[m.layers.length - 1];
+      const [kernel, bias] = head.getWeights();
+      const b = bias.arraySync().slice();
+      for (let i = 3; i < 6; i++) b[i] = CONFIG.policy.logStdInit;
+      head.setWeights([kernel, tf.tensor1d(b)]);
+    });
+
     this.actorOptimizer = tf.train.adam(this.learningRate);
     return m;
+  }
+
+  // Split the actor's six raw outputs into (mean, logStd, std).
+  //
+  // tanh on the mean keeps it inside the action range the launcher accepts;
+  // logStd is clipped rather than squashed, so its gradient is exactly zero
+  // outside the range instead of merely small — which is what stops a policy
+  // that is learning nothing from drifting the spread out forever.
+  _headSplit(raw) {
+    const mean = tf.tanh(raw.slice([0, 0], [-1, 3]));
+    const logStd = raw
+      .slice([0, 3], [-1, 3])
+      .clipByValue(CONFIG.policy.logStdMin, CONFIG.policy.logStdMax);
+    return { mean, logStd, std: tf.exp(logStd) };
   }
 
   _buildCritic() {
@@ -591,15 +653,31 @@ class CNNAgent {
     return m;
   }
 
+  // One standard normal, Box-Muller. Built on Math.random so a seeded run
+  // (tools/hpsearch replaces Math.random) still reproduces exactly.
+  static _gauss() {
+    // u must be non-zero for the log; Math.random() can return exactly 0.
+    const u = 1 - Math.random();
+    const v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
   // pixelDataBatch: Float32Array of size count * frameSize (frameSize = W*H*2).
   //
-  // The first greedyCount actions are returned unperturbed. Those balls are the
-  // batch's eval sample (CONFIG.evalBalls): they measure the policy itself,
-  // while the rest carry the exploration noise that generates the batch's
-  // variety. Taking them off the front rather than at random keeps the split
-  // stable across batches, so the eval rate is a fixed sample of the state
-  // distribution rather than a fresh one every time.
-  predictBatch(pixelDataBatch, noiseScale = 0, greedyCount = 0) {
+  // Actions are sampled from the policy's own Gaussian rather than perturbed by
+  // an external schedule, so there is no noise scale to pass any more — the
+  // spread is whatever the policy asked for at that state.
+  //
+  // The first greedyCount actions are the distribution's mean instead of a draw
+  // from it. Those balls are the batch's eval sample (CONFIG.evalBalls): they
+  // measure the policy itself, while the rest carry the exploration that
+  // generates the batch's variety. Taking them off the front rather than at
+  // random keeps the split stable across batches, so the eval rate is a fixed
+  // sample of the state distribution rather than a fresh one every time.
+  //
+  // Records the batch's mean standard deviation on the agent, so the spread the
+  // policy has settled on can be read off without a second forward pass.
+  predictBatch(pixelDataBatch, greedyCount = 0) {
     return tf.tidy(() => {
       // Derive the batch count from the data length instead of assuming a fixed
       // batch size, so a partial or resized batch reshapes correctly.
@@ -610,23 +688,32 @@ class CNNAgent {
         this.visionW,
         this.channels
       ]);
-      const data = this.actor.predict(stateTensor).dataSync(); // count * 3
-      // Clamp to [-1, 1] after adding exploration noise: the actor's output
-      // is tanh-bounded, and these actions are later stored as regression
-      // targets, so out-of-range values would be unreachable training goals.
+      const { mean, std } = this._headSplit(this.actor.predict(stateTensor));
+      const meanData = mean.dataSync();
+      const stdData = std.dataSync();
+
+      let stdSum = 0;
+      for (let i = 0; i < stdData.length; i++) stdSum += stdData[i];
+      this.lastMeanStd = stdData.length ? stdSum / stdData.length : 0;
+
+      // Clamp to [-1, 1]: the mean is tanh-bounded but a sample is not, and
+      // these actions are later used as the targets whose likelihood the actor
+      // is trained on, so out-of-range values would be unreachable goals.
       const clamp = (v) => Math.max(-1, Math.min(1, v));
       const actions = [];
       for (let i = 0; i < count; i++) {
-        // Note the noise draw happens either way: multiplying by a zero scale
-        // rather than skipping the call keeps the RNG stream identical whatever
-        // greedyCount is, so a seeded run (tools/hpsearch) stays comparable to
-        // one with a different eval split.
-        const scale = i < greedyCount ? 0 : noiseScale;
-        actions.push([
-          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * scale),
-          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * scale),
-          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * scale)
-        ]);
+        const a = [];
+        for (let k = 0; k < 3; k++) {
+          const j = i * 3 + k;
+          // The draw happens either way: scaling it to zero rather than
+          // skipping the call keeps the RNG stream identical whatever
+          // greedyCount is, so a seeded run (tools/hpsearch) stays comparable
+          // to one with a different eval split.
+          const g = CNNAgent._gauss();
+          const spread = i < greedyCount ? 0 : stdData[j];
+          a.push(clamp(meanData[j] + spread * g));
+        }
+        actions.push(a);
       }
       return actions;
     });
@@ -642,8 +729,11 @@ class CNNAgent {
       ]);
       for (let i = 0; i <= 3; i++) t = this.actor.layers[i].apply(t);
       const dense64 = t;
-      const output3 = this.actor.layers[4].apply(dense64);
-      return { dense: dense64.dataSync(), output: output3.dataSync() };
+      // The head is six wide now, but the activation panel draws the three
+      // action channels — so hand it the mean, post-tanh, which is what the
+      // three-output head used to return.
+      const { mean } = this._headSplit(this.actor.layers[4].apply(dense64));
+      return { dense: dense64.dataSync(), output: mean.dataSync() };
     });
   }
 
@@ -748,7 +838,11 @@ class CNNAgent {
     return Math.min(CONFIG.advantageClip, Math.exp(z / CONFIG.advantageTemp));
   }
 
-  // A second weighted-regression pass over a draw from the replay buffer.
+  // A second pass of the actor's objective over a draw from the replay
+  // buffer. It shares _fitActorWeighted, so replayed samples are fitted by
+  // the same advantage-weighted likelihood as the fresh batch — including
+  // the gradient on sigma, which they should contribute to as much as any
+  // other sample the policy is being judged on.
   //
   // The advantages are recomputed against the *current* critic rather than
   // reused from when the shot was taken: the critic is what a sample's
@@ -806,12 +900,22 @@ class CNNAgent {
     }
   }
 
-  // One epoch of minibatch Adam over a per-sample weighted MSE. model.fit()
-  // cannot do this: passing sampleWeight throws "Support sampleWeight is not
-  // implemented yet" in tfjs 4.x, so the update is driven explicitly. Minibatch
-  // size matches fit()'s default of 32 so the number of optimizer steps per
-  // batch is unchanged (CONFIG.actorMinibatch retunes it). Only trainableWeights
-  // are passed to minimize(), which already excludes the two frozen conv layers.
+  // One epoch of minibatch Adam over a per-sample advantage-weighted negative
+  // log-likelihood. model.fit() cannot do this: passing sampleWeight throws
+  // "Support sampleWeight is not implemented yet" in tfjs 4.x, so the update is
+  // driven explicitly. Minibatch size matches fit()'s default of 32 so the
+  // number of optimizer steps per batch is unchanged (CONFIG.actorMinibatch
+  // retunes it). Only trainableWeights are passed to minimize(), which already
+  // excludes the two frozen conv layers.
+  //
+  // The objective was a weighted squared error onto the action taken, which is
+  // the same thing as this likelihood at a fixed spread — so with sigma now
+  // part of the policy, keeping MSE would have trained the mean and left the
+  // spread with no gradient at all. Under the likelihood, a dimension whose
+  // high-advantage actions cluster tightly is fit better by a narrow Gaussian
+  // and sigma is pulled down; a dimension whose good actions are all over the
+  // place keeps a wide one. The log(sigma) term is what stops the trivial
+  // solution of shrinking sigma to nothing everywhere.
   _fitActorWeighted(states, actions, weights, minibatch = CONFIG.actorMinibatch) {
     const n = states.shape[0];
     const order = new Int32Array(n);
@@ -833,8 +937,13 @@ class CNNAgent {
         const wb = tf.gather(weights, idx);
         this.actorOptimizer.minimize(
           () => {
-            const pred = this.actor.apply(xb, { training: true });
-            const perSample = pred.sub(yb).square().mean(1);
+            const raw = this.actor.apply(xb, { training: true });
+            const { mean, logStd, std } = this._headSplit(raw);
+            // -log N(a | mean, std), dropping the constant 0.5*log(2*pi) per
+            // dimension: it shifts every sample's loss by the same amount and
+            // so contributes nothing to the gradient.
+            const z = yb.sub(mean).div(std);
+            const perSample = z.square().mul(0.5).add(logStd).sum(1);
             return perSample.mul(wb).mean();
           },
           false,
@@ -1711,6 +1820,7 @@ class Dashboard {
     this.uiAcc = document.getElementById("accuracy");
     this.uiEvalAcc = document.getElementById("eval-accuracy");
     this.uiRadius = document.getElementById("spawn-radius");
+    this.uiStd = document.getElementById("policy-std");
     this.uiStatus = document.getElementById("status");
     this.uiBatch = document.getElementById("batch-progress");
 
@@ -1735,6 +1845,7 @@ class Dashboard {
     accuracy,
     evalAccuracy,
     spawnRadius,
+    policyStd,
     baskets,
     episodes,
     illegalEntries
@@ -1749,6 +1860,11 @@ class Dashboard {
     // measured at, since the curriculum is what decides how hard the batch was.
     if (this.uiRadius && spawnRadius != null)
       this.uiRadius.innerText = spawnRadius.toFixed(1) + " ft";
+    // The spread the policy chose, which used to be a number on a schedule and
+    // is now the most direct readout of whether the agent thinks it knows what
+    // it is doing.
+    if (this.uiStd && policyStd != null)
+      this.uiStd.innerText = policyStd.toFixed(3);
     this.uiBaskets.innerText = baskets;
     this.uiEp.innerText = episodes;
     if (this.uiIllegal) this.uiIllegal.innerText = illegalEntries;
@@ -2047,7 +2163,12 @@ class TrainingArena {
       )
     );
     this.isTrainingStep = false;
-    this.exploreNoise = CONFIG.exploreNoise;
+    // Not a schedule any more — the mean spread the policy chose for the last
+    // batch, read back after predictBatch. Kept under this name because it is
+    // what the dashboard and the search harness report as the batch's noise,
+    // and it means the same thing: how far the shots taken were from the
+    // policy's mean action.
+    this.exploreNoise = Math.exp(CONFIG.policy.logStdInit);
   }
 
   // Position all balls but don't launch (initial state / warm-up).
@@ -2079,11 +2200,8 @@ class TrainingArena {
       trajectoryGroup: this.trajectory.group
     });
     this.batchPixels = batch;
-    const actions = this.agent.predictBatch(
-      batch,
-      this.exploreNoise,
-      this.evalBalls
-    );
+    const actions = this.agent.predictBatch(batch, this.evalBalls);
+    this.exploreNoise = this.agent.lastMeanStd;
     for (let i = 0; i < this.balls.length; i++)
       this.balls[i].launch(actions[i], this.hoopPos);
     this.field.flush();
@@ -2212,6 +2330,7 @@ class TrainingArena {
       // Null until the first eval ball has been graded.
       evalAccuracy: this.evalHistory.n ? this.evalHistory.value : null,
       spawnRadius: this.spawnRadius,
+      policyStd: this.exploreNoise,
       baskets: this.episodeStats.baskets,
       episodes: this.episodeStats.count,
       illegalEntries: this.episodeStats.illegal
@@ -2227,12 +2346,8 @@ class TrainingArena {
 
     this._advanceCurriculum(rollingAcc);
 
-    // Anneal exploration once per trained batch so the policy tightens toward
-    // exploitation as it improves, with a floor that keeps a little jitter.
-    this.exploreNoise = Math.max(
-      CONFIG.exploreNoiseMin,
-      this.exploreNoise * CONFIG.exploreNoiseDecay
-    );
+    // No annealing step: the spread is a policy output now, so it moves when
+    // the actor update moves it and resetBatch reads back what it became.
 
     this.resetBatch(manualMesh);
     this.isTrainingStep = false;

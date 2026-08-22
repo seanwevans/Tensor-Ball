@@ -41,12 +41,17 @@ terminal reward, so there's no temporal credit assignment.
   scoring on the way back down, because its proximity shaping is otherwise the
   best in the batch and shooting straight up through the net would be the
   easiest policy to learn.
-- **Exploration** — Gaussian-ish noise added to actions, annealed over training
-  so the agent explores widely early and exploits as it improves. A slice of
-  each batch (`CONFIG.evalBalls`) is launched with the noise switched off, so
-  the dashboard reports the policy's own accuracy next to the behaviour
-  policy's — the two move independently, and only the first one is what the
-  agent has learned.
+- **Exploration** — the policy is Gaussian and learns its own spread. The actor
+  emits a mean and a log standard deviation per action channel, shots are
+  sampled from that distribution, and the advantage-weighted objective is the
+  likelihood of the action taken. So exploration narrows where the agent's good
+  shots agree and stays wide where they do not — per state, rather than on a
+  global schedule (`CONFIG.policy` sets where it starts and how far it may go).
+  The current spread is on the dashboard as Policy Sigma. A slice of each batch
+  (`CONFIG.evalBalls`) takes the distribution's mean instead of a draw from it,
+  so the dashboard reports the policy's own accuracy next to the behaviour
+  policy's — the two move independently, and only the first is what the agent
+  has learned.
 - **Replay** — the highest-advantage shots are kept in a fixed-capacity buffer
   (`CONFIG.replay`) and replayed into each actor update, so a made basket is
   worth more than the single gradient step it used to get before being
@@ -82,6 +87,9 @@ The app opens in **manual mode** with a single ball you can play with:
 | Reset the ball | Space |
 | Start / stop learning | **START TRAINING** button |
 | Save the trained policy | **EXPORT POLICY** button (downloads the actor) |
+
+The exported actor has a six-wide head: three action means (apply `tanh`) and
+three log standard deviations. Take the means for a deterministic policy.
 
 While training, the manual ball is disabled and the batch takes over the court.
 Stopping training clears the batch off the floor and hands the court back.
