@@ -1297,7 +1297,12 @@ class SceneManager {
     dir.shadow.mapSize.width = 2048;
     dir.shadow.mapSize.height = 2048;
 
-    const hoop = new THREE.SpotLight(0xffffff, 2.0);
+    // The spot over the target hoop, dimmer than it was. It used to be the
+    // only real light in the building, so it had to carry the whole picture at
+    // intensity 2 and did it by blowing out the paint under the basket. With
+    // the banks below lighting the floor, it goes back to being what it looks
+    // like — the basket picked out a little brighter than the rest.
+    const hoop = new THREE.SpotLight(0xffffff, 0.8);
     hoop.position.set(25, 25, 0);
     hoop.target.position.set(CONFIG.rim.x, CONFIG.rim.y, CONFIG.rim.z);
     hoop.angle = Math.PI / 6;
@@ -1305,6 +1310,46 @@ class SceneManager {
     hoop.castShadow = true;
 
     this.scene.add(ambient, dir, hoop, hoop.target);
+    for (const light of SceneManager._arenaBanks())
+      this.scene.add(light, light.target);
+  }
+
+  // Six lights in two banks, hung outside the sidelines and angled in across
+  // the court, which is how a gym is actually lit: nothing hangs over the
+  // playing surface, and every point on the floor is covered from both sides
+  // so the pools overlap instead of leaving the far end in the dark.
+  //
+  // The point is not atmosphere. The agents see the court through a 96x96
+  // grayscale window, and under a single hoop spot the floor away from the
+  // basket sat at nearly the value of the unlit background — a ball out there
+  // was a dark blob against dark nothing, which is a bad state to have to
+  // learn a shot from. Even light across the floor is what makes the ball, the
+  // markings and the far half of the court legible at that resolution.
+  //
+  // None of the six casts a shadow, deliberately. VisionSystem renders the
+  // scene twice per ball — 2048 renders a batch at batchSize 1024 — and every
+  // shadow-casting light adds a full shadow pass to each of them. The
+  // directional key and the hoop spot stay the only casters, so the ball keeps
+  // the floor shadow that tells the agent how high it is; the banks are fill
+  // and cost only their share of the fragment shader.
+  static _arenaBanks() {
+    const lights = [];
+    // 32ft out puts the rig past the 25ft sideline, and 42ft up clears the
+    // backboards and their poles by three times the height of a player.
+    for (const z of [-32, 32])
+      for (const x of [-30, 0, 30]) {
+        // Slightly warm, the way a gym reads next to the daylight-white key.
+        const light = new THREE.SpotLight(0xfff4e6, 0.5);
+        light.position.set(x, 42, z);
+        // Aimed past the middle line rather than straight down, so each bank
+        // washes the far side of the court and the two overlap in the middle.
+        light.target.position.set(x, 0, -z * 0.35);
+        light.angle = 0.55;
+        light.penumbra = 0.8;
+        light.castShadow = false;
+        lights.push(light);
+      }
+    return lights;
   }
 
   render() {
