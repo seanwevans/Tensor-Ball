@@ -31,7 +31,9 @@ terminal reward, so there's no temporal credit assignment.
   the actions that beat the critic's value estimate (positive advantage), a form
   of self-imitation / advantage-weighted regression.
 - **Reward** — a made basket scores far and away the highest (bonused by shot
-  distance); near misses are shaped by how close the ball got to the rim, with
+  distance), where "made" means the ball's centre crossed the rim's plane
+  descending and inside the hole — the hole minus the ball, 0.30ft
+  (`CONFIG.hoopEntry.scoreRadius`), not merely somewhere near the rim; near misses are shaped by how close the ball got to the rim, with
   small bonuses for hitting the rim or backboard. Direction through the hoop is
   what separates the top of the scale from the bottom: a ball that comes *up*
   through the rim from underneath takes a large flat penalty and is barred from
