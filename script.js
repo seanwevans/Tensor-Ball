@@ -758,6 +758,172 @@ class ReplayBuffer {
   }
 }
 
+// A zip writer and reader, small enough to be worth having so the policy can
+// leave and arrive as one file.
+//
+// Nothing here compresses. The payload is a float32 weight blob that deflate
+// barely dents, and a stored archive is still an ordinary zip that any tool
+// will open — which is the whole reason for using the format instead of
+// inventing a container. Reading does handle deflated entries, because a
+// policy that has been through some other zip tool on its way back will be
+// compressed and refusing it would be a strange thing for the importer to do.
+class Zip {
+  // entries: [{ name, data: Uint8Array }] -> Uint8Array holding the archive.
+  static write(entries) {
+    const encoder = new TextEncoder();
+    const parts = [];
+    const directory = [];
+    let offset = 0;
+
+    for (const entry of entries) {
+      const name = encoder.encode(entry.name);
+      const crc = Zip._crc32(entry.data);
+      const size = entry.data.length;
+
+      const local = new DataView(new ArrayBuffer(30 + name.length));
+      local.setUint32(0, 0x04034b50, true);
+      local.setUint16(4, 20, true); // version needed: 2.0, stored
+      local.setUint16(6, 0, true); // no flags
+      local.setUint16(8, 0, true); // method: stored
+      // Timestamps stay zero — 1980-01-01 to anything that reads them. They
+      // are local-time DOS fields, so stamping them would make two exports of
+      // identical weights differ by nothing but the clock.
+      local.setUint16(10, 0, true);
+      local.setUint16(12, 0, true);
+      local.setUint32(14, crc, true);
+      local.setUint32(18, size, true);
+      local.setUint32(22, size, true);
+      local.setUint16(26, name.length, true);
+      local.setUint16(28, 0, true);
+      const localBytes = new Uint8Array(local.buffer);
+      localBytes.set(name, 30);
+      parts.push(localBytes, entry.data);
+
+      const central = new DataView(new ArrayBuffer(46 + name.length));
+      central.setUint32(0, 0x02014b50, true);
+      central.setUint16(4, 20, true);
+      central.setUint16(6, 20, true);
+      // 16, not 14: the central record carries two more bytes of version
+      // before the timestamps than the local header does.
+      central.setUint32(16, crc, true);
+      central.setUint32(20, size, true);
+      central.setUint32(24, size, true);
+      central.setUint16(28, name.length, true);
+      central.setUint32(42, offset, true);
+      const centralBytes = new Uint8Array(central.buffer);
+      centralBytes.set(name, 46);
+      directory.push(centralBytes);
+
+      offset += localBytes.length + size;
+    }
+
+    let directorySize = 0;
+    for (const record of directory) directorySize += record.length;
+
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, entries.length, true);
+    end.setUint16(10, entries.length, true);
+    end.setUint32(12, directorySize, true);
+    end.setUint32(16, offset, true);
+
+    parts.push(...directory, new Uint8Array(end.buffer));
+    let total = 0;
+    for (const part of parts) total += part.length;
+    const archive = new Uint8Array(total);
+    let at = 0;
+    for (const part of parts) {
+      archive.set(part, at);
+      at += part.length;
+    }
+    return archive;
+  }
+
+  // -> [{ name, data: Uint8Array }], names exactly as stored.
+  static async read(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const view = new DataView(
+      bytes.buffer,
+      bytes.byteOffset,
+      bytes.byteLength
+    );
+
+    // The end-of-central-directory record is last and 22 bytes with no
+    // comment, but scan backwards anyway so an archive carrying one opens.
+    let end = -1;
+    const floor = Math.max(0, bytes.length - 22 - 0xffff);
+    for (let i = bytes.length - 22; i >= floor; i--)
+      if (view.getUint32(i, true) === 0x06054b50) {
+        end = i;
+        break;
+      }
+    if (end < 0) throw new Error("Not a zip archive");
+
+    const count = view.getUint16(end + 10, true);
+    let at = view.getUint32(end + 16, true);
+    const entries = [];
+    for (let i = 0; i < count; i++) {
+      if (view.getUint32(at, true) !== 0x02014b50)
+        throw new Error("The archive's directory is corrupt");
+      const method = view.getUint16(at + 10, true);
+      const crc = view.getUint32(at + 16, true);
+      const stored = view.getUint32(at + 20, true);
+      const nameLength = view.getUint16(at + 28, true);
+      const extraLength = view.getUint16(at + 30, true);
+      const commentLength = view.getUint16(at + 32, true);
+      const header = view.getUint32(at + 42, true);
+      const name = new TextDecoder().decode(
+        bytes.subarray(at + 46, at + 46 + nameLength)
+      );
+
+      // The local header repeats the name and may carry different extra
+      // fields, so where the bytes actually start comes from its own lengths.
+      const from =
+        header +
+        30 +
+        view.getUint16(header + 26, true) +
+        view.getUint16(header + 28, true);
+      const raw = bytes.subarray(from, from + stored);
+      const data = method === 0 ? raw : await Zip._inflate(raw);
+      // A truncated download would otherwise arrive as a model made of
+      // plausible-looking garbage. The checksum is right there; check it.
+      if (Zip._crc32(data) !== crc)
+        throw new Error(`${name} is corrupt (checksum mismatch)`);
+      entries.push({ name, data });
+
+      at += 46 + nameLength + extraLength + commentLength;
+    }
+    return entries;
+  }
+
+  static async _inflate(data) {
+    if (typeof DecompressionStream !== "function")
+      throw new Error(
+        "The archive is compressed and this browser cannot unpack it"
+      );
+    const stream = new Blob([data])
+      .stream()
+      .pipeThrough(new DecompressionStream("deflate-raw"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  static _crc32(data) {
+    let table = Zip._crcTable;
+    if (!table) {
+      table = Zip._crcTable = new Uint32Array(256);
+      for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        table[i] = c >>> 0;
+      }
+    }
+    let crc = 0xffffffff;
+    for (let i = 0; i < data.length; i++)
+      crc = table[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+}
+
 class CNNAgent {
   constructor({ learningRate, batchSize, l2 }) {
     this.learningRate = learningRate;
@@ -1064,21 +1230,89 @@ class CNNAgent {
     }
   }
 
+  // The policy leaves as one file. The archive holds exactly what TensorFlow's
+  // own two-file save produces — the topology JSON and its weight blob — so
+  // anything that unzips it gets an ordinary tfjs model back, while what the
+  // user keeps, moves and hands to IMPORT POLICY is a single thing that cannot
+  // arrive half missing.
   async saveActor() {
-    await this.actor.save("downloads://basketball-agent-actor");
+    const WEIGHTS = "model.weights.bin";
+    const entries = [];
+
+    await this.actor.save(
+      tf.io.withSaveHandler(async (artifacts) => {
+        entries.push({
+          name: "model.json",
+          data: new TextEncoder().encode(
+            JSON.stringify({
+              modelTopology: artifacts.modelTopology,
+              format: artifacts.format,
+              generatedBy: artifacts.generatedBy,
+              convertedBy: artifacts.convertedBy,
+              // One shard: the actor is a few hundred KB, and the multi-file
+              // sharding tfjs does for large models is the thing being
+              // collapsed here.
+              weightsManifest: [
+                { paths: [WEIGHTS], weights: artifacts.weightSpecs }
+              ]
+            })
+          )
+        });
+        entries.push({
+          name: WEIGHTS,
+          data: new Uint8Array(artifacts.weightData)
+        });
+        return { modelArtifactsInfo: tf.io.getModelArtifactsInfoForJSON(artifacts) };
+      })
+    );
+
+    const url = URL.createObjectURL(
+      new Blob([Zip.write(entries)], { type: "application/zip" })
+    );
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "basketball-agent-actor.zip";
+    anchor.click();
+    // The object URL pins the archive in memory until it is revoked, and
+    // revoking it in the same task can cancel the download that was just
+    // started, so let the click get clear of it first.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  async loadActor(files) {
-    const list = Array.from(files);
-    const topology = list.find((f) => f.name.endsWith(".json"));
-    const binaries = list.filter((f) => f !== topology);
+  // The mirror of saveActor: one archive in, the running policy replaced.
+  //
+  // The zip is unpacked in memory and handed to tf.io.browserFiles as the File
+  // pair it already knows how to read, so the loading itself is still tfjs's —
+  // the archive is a container, not a second format. Names are reduced to
+  // their basename on the way through, so an archive somebody rebuilt with the
+  // two files inside a folder still loads.
+  //
+  // The weights are copied into the existing actor rather than the loaded
+  // model being swapped in for it: this.actor carries state a fresh
+  // deserialization does not — its compile, and the layer indices
+  // getActivations() reads — and setWeights assigns into the variables
+  // actorOptimizer is already bound to, so training resumes on the imported
+  // policy instead of on an optimizer that has never seen it.
+  async loadActor(file) {
+    if (!file) throw new Error("No archive selected");
+
+    const entries = (await Zip.read(await file.arrayBuffer())).map((entry) => ({
+      data: entry.data,
+      name: entry.name.slice(entry.name.lastIndexOf("/") + 1)
+    }));
+    const topology = entries.find((entry) => entry.name.endsWith(".json"));
+    const binaries = entries.filter((entry) => entry.name.endsWith(".bin"));
     if (!topology || !binaries.length)
       throw new Error(
-        "Select both files the export produced: the .json and its .weights.bin"
+        "The archive holds no policy: expected a model .json and its .bin"
       );
 
+    const asFile = (entry, type) => new File([entry.data], entry.name, { type });
     const loaded = await tf.loadLayersModel(
-      tf.io.browserFiles([topology, ...binaries])
+      tf.io.browserFiles([
+        asFile(topology, "application/json"),
+        ...binaries.map((entry) => asFile(entry, "application/octet-stream"))
+      ])
     );
     try {
       const source = loaded.getWeights();
@@ -3147,15 +3381,15 @@ class App {
     });
 
     importInput.addEventListener("change", async () => {
-      // Snapshot the selection before clearing the picker: value = "" empties
-      // the live FileList, and the clear has to happen either way so that
-      // re-selecting the same files still fires change — the obvious thing to
-      // do after a failed import.
-      const files = Array.from(importInput.files || []);
+      // Take the file before clearing the picker: value = "" empties the live
+      // FileList, and the clear has to happen either way so that re-selecting
+      // the same archive still fires change — the obvious thing to do after a
+      // failed import.
+      const [archive] = Array.from(importInput.files || []);
       importInput.value = "";
-      if (!this.agent || !files.length) return;
+      if (!this.agent || !archive) return;
       try {
-        await this.agent.loadActor(files);
+        await this.agent.loadActor(archive);
         this.dashboard.setStatus("Policy Imported", "#0f0");
       } catch (e) {
         console.error("Policy import failed", e);
