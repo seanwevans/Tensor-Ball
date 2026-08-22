@@ -400,6 +400,10 @@ class Assets {
     // shaded black would go grey under the hoop light and lose the contrast
     // that is the whole point of them.
     this.boardMark = new THREE.MeshBasicMaterial({ color: 0x111111 });
+    // Unlit, and the brightest thing on the court: the net is the agents'
+    // marker for where the hole is, and a shaded white would go grey under the
+    // basket exactly where it is needed most.
+    this.net = new THREE.LineBasicMaterial({ color: 0xffffff });
     this.rim = new THREE.MeshStandardMaterial({
       color: 0xff4400,
       metalness: 0.6,
@@ -1822,6 +1826,8 @@ class Court {
     group.add(rim);
     if (!isLeft) this.rimMesh = rim;
 
+    group.add(this._buildNet(rimX));
+
     const poleBody = this._staticBody(
       baseX + sign * 6,
       6,
@@ -1914,6 +1920,60 @@ class Court {
       rect(W, RECT_H - 2 * W, side * (RECT_W / 2 - W / 2), base + RECT_H / 2);
 
     return new THREE.Mesh(Court._mergeFlat(g), this.assets.boardMark);
+  }
+
+  // The net: twelve strands hung off the ring, tapering in over 15in, drawn as
+  // one LineSegments.
+  //
+  // Lines rather than geometry, and no physics body. A net is a soft body, and
+  // simulating one per hoop for a batch of a thousand balls is a different
+  // project — cannon has no cloth, and faking it with linked bodies would put
+  // hundreds of constraints under a rim that a ball passes through in three
+  // steps. Nothing about scoring needs it either: the sensor under the ring
+  // decides makes, and it is the ring that a shot bounces off.
+  //
+  // What the net is for is reading the basket. The ring is a 0.1ft torus seen
+  // nearly edge-on from a ball's height, which at 96px is a few orange pixels;
+  // the net hangs a bright, tapering cone below it that says where the hole is
+  // and, because it is a fixed real size, roughly how far away it is. One
+  // draw call per hoop, unlit, so it costs the vision capture nothing but its
+  // own pixels and stays the same white in both render modes.
+  _buildNet(rimX) {
+    const STRANDS = 12;
+    const ROWS = 4;
+    const TOP_R = 0.75; // hung off the ring, so the ring's own radius
+    const BOTTOM_R = 0.45; // the taper every net has under its own weight
+    const LENGTH = 1.25; // 15in, the short end of the legal range
+
+    // Half a step of twist per row is what turns pairs of strands into the
+    // diamonds a net is actually knotted into.
+    const node = (row, i) => {
+      const t = row / ROWS;
+      const r = TOP_R + (BOTTOM_R - TOP_R) * t;
+      const a = ((i + row / 2) / STRANDS) * Math.PI * 2;
+      return [
+        rimX + Math.cos(a) * r,
+        CONFIG.rim.y - LENGTH * t,
+        Math.sin(a) * r
+      ];
+    };
+
+    const pts = [];
+    const seg = (a, b) => pts.push(...a, ...b);
+    for (let row = 0; row < ROWS; row++)
+      for (let i = 0; i < STRANDS; i++) {
+        // Down-left and down-right from every node: between them the two
+        // diagonals draw both sets of strands and close the diamonds.
+        seg(node(row, i), node(row + 1, i));
+        seg(node(row, i), node(row + 1, i - 1));
+      }
+    // The hem, which is what keeps the bottom row from reading as a fringe.
+    for (let i = 0; i < STRANDS; i++)
+      seg(node(ROWS, i), node(ROWS, i + 1));
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+    return new THREE.LineSegments(geom, this.assets.net);
   }
 
   // Switch the court between the way the player sees it and the way the agents
