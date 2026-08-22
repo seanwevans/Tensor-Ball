@@ -396,6 +396,10 @@ class Assets {
       reflectivity: 1.0,
       clearcoat: 1.0
     });
+    // Unlit: the backboard markings are paint on a bright white slab, and a
+    // shaded black would go grey under the hoop light and lose the contrast
+    // that is the whole point of them.
+    this.boardMark = new THREE.MeshBasicMaterial({ color: 0x111111 });
     this.rim = new THREE.MeshStandardMaterial({
       color: 0xff4400,
       metalness: 0.6,
@@ -1606,8 +1610,27 @@ class Court {
     pole.position.set(baseX + sign * 6, 6, 0);
     group.add(pole);
 
-    // The backboard is a solid slab rather than the 0.1ft sheet of glass it
-    // used to be, because at 0.1ft the balls went straight through it.
+    // The backboard, to the rulebook: 6ft wide by 3.5ft tall (72x42in), its
+    // face 4ft in from the baseline, and its lower edge 9.5ft off the floor
+    // (2.90m). Those three put the ring — 10ft up and 15in out from the face —
+    // 6in above the bottom edge and centered on the board, and top the board
+    // out at 13ft, which is the geometry every bank shot in the sport is
+    // taken against.
+    //
+    // Only the height was ever wrong: the board hung with its bottom edge at
+    // 9ft, a foot below the ring instead of six inches, so it presented half a
+    // foot of extra board under the rim and half a foot too little above it.
+    // The face was also 0.6in proud of the 4ft line, a leftover from when the
+    // board was a 0.1ft sheet centered on boardX; with the face on the line,
+    // the 1.25ft to the middle of the ring is exactly the rulebook's 6in of
+    // gap plus the ring's 9in radius.
+    const BOARD_WIDTH = 6;
+    const BOARD_HEIGHT = 3.5;
+    const BOARD_BOTTOM = 9.5;
+    const boardCenterY = BOARD_BOTTOM + BOARD_HEIGHT / 2;
+
+    // The board is a solid slab rather than the 0.1ft sheet of glass it used
+    // to be, because at 0.1ft the balls went straight through it.
     //
     // cannon steps at a fixed 1/60s and actions are clamped to [-1, 1], so a
     // ball leaves the launcher at up to the corner of CONFIG.launch's envelope
@@ -1625,19 +1648,27 @@ class Court {
     // The mesh is built from the same numbers as the body so the board that is
     // drawn is exactly the board that collides — thickening only the physics
     // box would trade shots through the glass for shots bouncing off thin air
-    // behind it. Only the back of the board moves: the court-facing face stays
-    // where it was, so bank shots play exactly as before.
+    // behind it. The depth is spent backwards, away from the court, so the
+    // face the ball meets is the regulation plane and not 7in in front of it.
     const boardHalfDepth = 0.6;
-    const boardFaceX = boardX - sign * 0.05;
+    const boardFaceX = boardX;
     const boardCenterX = boardFaceX + sign * boardHalfDepth;
 
     const board = new THREE.Mesh(
-      new THREE.BoxGeometry(boardHalfDepth * 2, 3.5, 6),
+      new THREE.BoxGeometry(boardHalfDepth * 2, BOARD_HEIGHT, BOARD_WIDTH),
       this.assets.glass
     );
-    board.position.set(boardCenterX, 10.75, 0);
+    board.position.set(boardCenterX, boardCenterY, 0);
     group.add(board);
     this.boardMeshes.push(board);
+
+    group.add(
+      this._boardMarkings(boardFaceX, sign, boardCenterY, {
+        width: BOARD_WIDTH,
+        height: BOARD_HEIGHT,
+        bottom: BOARD_BOTTOM
+      })
+    );
 
     const rim = new THREE.Mesh(
       new THREE.TorusGeometry(0.75, 0.05, 16, 100),
@@ -1658,9 +1689,11 @@ class Court {
 
     const boardBody = this._staticBody(
       boardCenterX,
-      10.75,
+      boardCenterY,
       0,
-      new CANNON.Box(new CANNON.Vec3(boardHalfDepth, 1.75, 3))
+      new CANNON.Box(
+        new CANNON.Vec3(boardHalfDepth, BOARD_HEIGHT / 2, BOARD_WIDTH / 2)
+      )
     );
     this.physics.add(boardBody);
     if (!isLeft) this.backboardBody = boardBody;
@@ -1688,6 +1721,56 @@ class Court {
     if (!isLeft) this.scoringSensor = sensorBody;
 
     return group;
+  }
+
+  // The rulebook's backboard markings: a 2in line around the border of the
+  // board, and the 24x18in rectangle centered behind the ring with its base
+  // level with the ring at 10ft.
+  //
+  // Black, not white. The rules give both — white lines on a transparent
+  // board, black on a solid one — and this board renders as a solid white
+  // slab, so white would be a marking nobody can see. Black on white is also
+  // the strongest edge anywhere on the board at 96px, which matters more here
+  // than it does in a gym: the rectangle is the only aiming feature the board
+  // has, and a bank shot is the agent lining that rectangle up.
+  //
+  // Eight quads, merged into one mesh, half an inch off the face — far enough
+  // out of the depth buffer's way at this near plane, near enough that a ball
+  // meeting the glass still meets it flush. One mesh because the vision
+  // capture renders the scene twice per ball, so a draw call added here is
+  // paid two thousand times a batch (see _buildMarkings).
+  _boardMarkings(faceX, sign, centerY, board) {
+    const W = 0.1667; // 2in line, the width the rulebook gives
+    const x = faceX - sign * 0.05;
+    const g = [];
+    // Built in the board's plane and turned to face the court: after the
+    // rotation the quad's width runs along z and its height along y.
+    const rect = (w, h, z, y) => {
+      const geom = new THREE.PlaneGeometry(w, h);
+      geom.rotateY((-sign * Math.PI) / 2);
+      geom.translate(x, y, z);
+      g.push(geom);
+    };
+
+    // Border, inset so the outer edge of the line is the edge of the board.
+    const halfW = board.width / 2;
+    const halfH = board.height / 2;
+    rect(board.width, W, 0, centerY + halfH - W / 2);
+    rect(board.width, W, 0, centerY - halfH + W / 2);
+    for (const side of [-1, 1])
+      rect(W, board.height - 2 * W, side * (halfW - W / 2), centerY);
+
+    // Shooter's rectangle: 24in wide, 18in tall, outer edges, sitting on the
+    // ring's plane rather than on the bottom of the board.
+    const RECT_W = 2;
+    const RECT_H = 1.5;
+    const base = CONFIG.rim.y;
+    rect(RECT_W, W, 0, base + W / 2);
+    rect(RECT_W, W, 0, base + RECT_H - W / 2);
+    for (const side of [-1, 1])
+      rect(W, RECT_H - 2 * W, side * (RECT_W / 2 - W / 2), base + RECT_H / 2);
+
+    return new THREE.Mesh(Court._mergeFlat(g), this.assets.boardMark);
   }
 
   // Switch the court between the way the player sees it and the way the agents
