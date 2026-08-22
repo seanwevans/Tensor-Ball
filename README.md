@@ -105,22 +105,28 @@ The app opens in **manual mode** with a single ball you can play with:
 | Reset the ball | Space |
 | Start / stop learning | **START TRAINING** button |
 | Save the trained policy | **EXPORT POLICY** button (downloads the actor) |
-| Load a saved policy | **IMPORT POLICY** button (select both exported files) |
+| Load a saved policy | **IMPORT POLICY** button (select the exported .zip) |
 
 The exported actor has an eight-wide head: four action means (apply `tanh`) and
 four log standard deviations. Take the means for a deterministic policy.
 
-**EXPORT POLICY** downloads the two files TensorFlow.js writes for a model —
-`basketball-agent-actor.json` (topology) and `basketball-agent-actor.weights.bin`
-— and **IMPORT POLICY** takes that pair back, in either order. The weights are
-copied into the running actor, so training continues from the imported policy
-rather than from scratch; the shared conv filters are pushed into the critic at
-the same time, so the first batch after an import does not overwrite them. A
-file exported under a different `visionWidth`/`visionHeight`, or from a build
-with a different action space, is rejected on a shape check and leaves the
-running policy alone. Import is only available while training is stopped: the
-batch in flight was shot by the outgoing policy, and the update it triggers on
-landing would pull the freshly imported actor back toward it.
+**EXPORT POLICY** downloads one file, `basketball-agent-actor.zip`, and
+**IMPORT POLICY** takes it back. Inside the archive is exactly what
+TensorFlow.js writes for a model — `model.json` (topology) and
+`model.weights.bin` — so unzipping it gives an ordinary tfjs model that
+`tf.loadLayersModel` will read anywhere else; the archive is a container, not a
+second format. Rezipping those two files with any tool produces something the
+importer still accepts, compressed or not, and in a folder or not.
+
+The weights are copied into the running actor, so training continues from the
+imported policy rather than from scratch; the shared conv filters are pushed
+into the critic at the same time, so the first batch after an import does not
+overwrite them. An archive that has been truncated or corrupted fails its
+checksum, and one exported under a different `visionWidth`/`visionHeight` or
+from a build with a different action space fails a shape check — either way the
+running policy is left alone. Import is only available while training is
+stopped: the batch in flight was shot by the outgoing policy, and the update it
+triggers on landing would pull the freshly imported actor back toward it.
 
 While training, the manual ball is disabled and the batch takes over the court.
 Stopping training clears the batch off the floor and hands the court back.
