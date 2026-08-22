@@ -1335,11 +1335,16 @@ class CNNAgent {
           );
       }
 
+      // Only the actor. The critic used to own the shared conv backbone and
+      // copy it into the actor after every batch, so an import that did not
+      // also seed the critic would have been undone by the first update — that
+      // is what the copy here was for. The nets have had independent backbones
+      // since the actor started training end-to-end, and copying now does the
+      // opposite of repair: it throws away the critic's own learned features
+      // and replaces them with the imported actor's, leaving the value
+      // estimate that every advantage is measured against to relearn from a
+      // stranger's encoder.
       this.actor.setWeights(source);
-      tf.tidy(() => {
-        for (let i = 0; i < 2; i++)
-          this.critic.layers[i].setWeights(this.actor.layers[i].getWeights());
-      });
     } finally {
       loaded.dispose();
     }
