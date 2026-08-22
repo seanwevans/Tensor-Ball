@@ -41,7 +41,30 @@ const CONFIG = {
   learningRate: 0.001,
   l2: 0.001,
   maxHistory: 100,
-  accuracyWindow: 1024,
+  // Shots the reported accuracy averages over. This was 1024 — exactly one
+  // batch at the default batchSize — so the "rolling" accuracy was just the
+  // last batch's rate, and a run's accuracy trace carried a full batch's worth
+  // of binomial noise on every point. Over eight batches the same trace is
+  // readable, which matters when the question being asked of it is whether a
+  // slow climb has flattened out.
+  accuracyWindow: 8192,
+  // Closest a ball may spawn to the rim's axis, in feet.
+  //
+  // Spawns were drawn from the whole half court, rim included. Two things go
+  // wrong in the column right under the hoop. dirToHoop is the difference of
+  // two nearly equal positions, and three.js normalize() returns the zero
+  // vector rather than NaN when that difference is ~0, so the forward
+  // component of the launch silently vanishes and the ball goes straight up.
+  // And a ball starting under the rim can only ever pass through it from
+  // below, which is an illegalEntry: the largest negative reward in the table,
+  // handed out for a state with no action that avoids it.
+  //
+  // Those samples are pure noise in the advantage — a big penalty uncorrelated
+  // with anything the policy could have done differently. 2ft clears the rim
+  // column (0.55) with room to spare, and spawns at 2ft still have a make
+  // available: sweeping the action space per distance band, 100% of 2-4ft
+  // spawns have a clean swish reachable.
+  minSpawnDistance: 2.0,
   // The policy is Gaussian and learns its own spread, so there is no
   // exploration schedule to tune — exploreNoise / exploreNoiseMin /
   // exploreNoiseDecay are gone. What replaces them:
@@ -49,11 +72,15 @@ const CONFIG = {
   // A global annealed noise is the wrong shape for this problem. It is one
   // number for every state, so it cannot be small where the policy is good and
   // large where it is not, and being on a schedule it stops shrinking whether
-  // or not the agent has earned it. At the shipped 0.999/batch it took ~980
-  // batches to reach the 0.15 floor — and at that floor every shot carries a
-  // permanent +/-0.075 of action, which caps how accurate any policy can
-  // possibly be. Modelling the best action available under a fixed jitter, a
-  // perfect policy tops out around 34% at 0.15 against 66% at 0.05.
+  // or not the agent has earned it. The schedule this replaces has since been
+  // retuned — 0.99/batch to a floor of 0.04, rather than 0.999 to 0.15 — which
+  // fixes how long it takes to arrive but not its shape: it is still one number
+  // for every state, and it still stops moving on a fixed date. And a floor is
+  // still a hard ceiling, because it is added to whatever the policy outputs
+  // and never goes away. Modelling the best action available to any policy
+  // under a fixed jitter, on the current launch envelope, 0.15 caps accuracy
+  // near 56% and 0.04 near 70% — better, but still a bound the agent cannot
+  // argue with.
   //
   // So make the spread part of the policy. The actor emits a mean and a log
   // standard deviation per action dimension, actions are sampled from that
@@ -1359,9 +1386,32 @@ class Ball {
   }
 
   // Position at a random launch spot and mark active/visible.
+  //
+  // Rejection-sampled away from the rim's column (CONFIG.minSpawnDistance).
+  // The loop is bounded and falls back to pushing the point radially out to
+  // the minimum, so this always terminates in a fixed worst case rather than
+  // spinning if the exclusion zone is ever configured larger than the court.
   spawn() {
-    const x = Math.random() * 42;
-    const z = (Math.random() - 0.5) * 46;
+    const rim = CONFIG.rim;
+    const min = CONFIG.minSpawnDistance;
+    let x = 0;
+    let z = 0;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      x = Math.random() * 42;
+      z = (Math.random() - 0.5) * 46;
+      if (Math.hypot(x - rim.x, z - rim.z) >= min) break;
+      if (attempt === 15) {
+        const dx = x - rim.x;
+        const dz = z - rim.z;
+        const d = Math.hypot(dx, dz);
+        // Straight down the +z axis when the draw landed exactly on the rim,
+        // which is the one direction guaranteed to stay on the court.
+        const ux = d > 1e-6 ? dx / d : 0;
+        const uz = d > 1e-6 ? dz / d : 1;
+        x = rim.x + ux * min;
+        z = rim.z + uz * min;
+      }
+    }
     const y = 4.5 + Math.random() * 1.5;
     this.body.position.set(x, y, z);
     this.body.velocity.set(0, 0, 0);
@@ -1957,6 +2007,35 @@ class Dashboard {
   }
 }
 
+// Fraction of the last `window` outcomes that were hits, kept as a ring buffer
+// with a running sum.
+//
+// The accuracy window used to be a plain array pushed and shift()ed. shift() is
+// O(n), and it ran once per ball per batch — fine while the window was one
+// batch long, quadratic in the window otherwise, and the window wants to be
+// several batches long to be readable at all.
+class RollingRate {
+  constructor(window) {
+    this.buf = new Uint8Array(Math.max(1, window));
+    this.i = 0;
+    this.n = 0;
+    this.sum = 0;
+  }
+
+  push(hit) {
+    const v = hit ? 1 : 0;
+    if (this.n === this.buf.length) this.sum -= this.buf[this.i];
+    else this.n++;
+    this.buf[this.i] = v;
+    this.sum += v;
+    this.i = (this.i + 1) % this.buf.length;
+  }
+
+  get value() {
+    return this.n ? this.sum / this.n : 0;
+  }
+}
+
 class TrainingArena {
   constructor({
     agent,
@@ -2004,10 +2083,18 @@ class TrainingArena {
     this.evalBalls = Math.min(CONFIG.evalBalls, CONFIG.batchSize);
 
     this.episodeStats = { count: 0, baskets: 0, shots: 0, illegal: 0 };
-    this.accuracyHistory = [];
-    // Graded separately from accuracyHistory: same window, but only the shots
-    // the exploration noise never touched.
-    this.evalHistory = [];
+    this.accuracyHistory = new RollingRate(CONFIG.accuracyWindow);
+    // Graded separately from accuracyHistory: only the shots the exploration
+    // noise never touched. Sized by evalBalls/batchSize so it spans the same
+    // number of *batches* as the behaviour window rather than the same number
+    // of shots — otherwise the eval rate would average over eight times as much
+    // history and visibly lag.
+    this.evalHistory = new RollingRate(
+      Math.max(
+        1,
+        Math.round((CONFIG.accuracyWindow * this.evalBalls) / CONFIG.batchSize)
+      )
+    );
     this.isTrainingStep = false;
     // Not a schedule any more — the mean spread the policy chose for the last
     // batch, read back after predictBatch. Kept under this name because it is
@@ -2147,31 +2234,17 @@ class TrainingArena {
       rewards.push(reward);
       this.episodeStats.shots++;
       this.episodeStats.count++;
-      this.accuracyHistory.push(b.scored ? 1 : 0);
-      if (this.accuracyHistory.length > CONFIG.accuracyWindow)
-        this.accuracyHistory.shift();
-      if (b.isEval) {
-        this.evalHistory.push(b.scored ? 1 : 0);
-        // Scaled so the eval window spans the same number of batches as the
-        // behaviour window, not the same number of shots — otherwise the eval
-        // rate would average over eight times as much history and lag.
-        const evalWindow = Math.max(
-          1,
-          Math.round(
-            (CONFIG.accuracyWindow * this.evalBalls) / CONFIG.batchSize
-          )
-        );
-        if (this.evalHistory.length > evalWindow) this.evalHistory.shift();
-      }
+      this.accuracyHistory.push(b.scored);
+      if (b.isEval) this.evalHistory.push(b.scored);
     }
     // The states are already contiguous and in ball order in batchPixels, so
     // the agent takes the whole array by reference instead of rebuilding it.
     this.agent.store(this.batchPixels, actions, rewards);
 
-    const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
     this.dashboard.setStats({
-      accuracy: mean(this.accuracyHistory),
-      evalAccuracy: this.evalHistory.length ? mean(this.evalHistory) : null,
+      accuracy: this.accuracyHistory.value,
+      // Null until the first eval ball has been graded.
+      evalAccuracy: this.evalHistory.n ? this.evalHistory.value : null,
       policyStd: this.exploreNoise,
       baskets: this.episodeStats.baskets,
       episodes: this.episodeStats.count,
