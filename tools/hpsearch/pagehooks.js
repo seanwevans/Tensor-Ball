@@ -78,6 +78,13 @@
         c.rewardSum += r.reward;
         c.types[r.type] = (c.types[r.type] || 0) + 1;
         c.dists.push(ball.minDist);
+        // The batch's greedy sample, graded on its own. `acc` below is the
+        // behaviour policy — policy plus exploration noise — so on its own it
+        // cannot say whether a config improved the policy or just annealed.
+        if (ball.isEval) {
+          c.evalN++;
+          if (r.type === "score") c.evalScore++;
+        }
       }
       return r;
     };
@@ -92,7 +99,15 @@
     TB.TrainingArena.prototype.finishBatch = async function (mesh) {
       if (H.done) return;
       const tStart = performance.now();
-      H.cur = { n: 0, rewardSum: 0, types: {}, dists: [], loss: null };
+      H.cur = {
+        n: 0,
+        rewardSum: 0,
+        types: {},
+        dists: [],
+        loss: null,
+        evalN: 0,
+        evalScore: 0
+      };
       const noise = this.exploreNoise;
       try {
         await finish.call(this, mesh);
@@ -110,6 +125,9 @@
         n: c.n,
         // Fraction of the batch that dropped through the rim from above.
         acc: (c.types.score || 0) / c.n,
+        // Accuracy of the noise-free balls only (CONFIG.evalBalls), or null on
+        // a build without the eval split.
+        accGreedy: c.evalN ? c.evalScore / c.evalN : null,
         illegal: (c.types.illegal || 0) / c.n,
         rim: (c.types.rim || 0) / c.n,
         meanReward: c.rewardSum / c.n,

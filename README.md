@@ -16,7 +16,8 @@ the critic learns the cloud pulls in toward the rim.
 Each ball carries a pair of stereo cameras pointed at the rim. Every training
 batch, the agent renders each ball's view, feeds the two grayscale images through
 a small convolutional network, and outputs a 3-vector launch action (vertical
-power, forward power, aim adjustment). The ball is launched, the physics play
+power, forward power, aim adjustment) — `CONFIG.launch` is the envelope in ft/s
+that vector is stretched onto. The ball is launched, the physics play
 out, and the shot's outcome becomes the reward. The agent learns from vision
 alone — it is never told where the hoop is.
 
@@ -31,7 +32,9 @@ terminal reward, so there's no temporal credit assignment.
   the actions that beat the critic's value estimate (positive advantage), a form
   of self-imitation / advantage-weighted regression.
 - **Reward** — a made basket scores far and away the highest (bonused by shot
-  distance); near misses are shaped by how close the ball got to the rim, with
+  distance), where "made" means the ball's centre crossed the rim's plane
+  descending and inside the hole — the hole minus the ball, 0.30ft
+  (`CONFIG.hoopEntry.scoreRadius`), not merely somewhere near the rim; near misses are shaped by how close the ball got to the rim, with
   small bonuses for hitting the rim or backboard. Direction through the hoop is
   what separates the top of the scale from the bottom: a ball that comes *up*
   through the rim from underneath takes a large flat penalty and is barred from
@@ -39,7 +42,15 @@ terminal reward, so there's no temporal credit assignment.
   best in the batch and shooting straight up through the net would be the
   easiest policy to learn.
 - **Exploration** — Gaussian-ish noise added to actions, annealed over training
-  so the agent explores widely early and exploits as it improves.
+  so the agent explores widely early and exploits as it improves. A slice of
+  each batch (`CONFIG.evalBalls`) is launched with the noise switched off, so
+  the dashboard reports the policy's own accuracy next to the behaviour
+  policy's — the two move independently, and only the first one is what the
+  agent has learned.
+- **Replay** — the highest-advantage shots are kept in a fixed-capacity buffer
+  (`CONFIG.replay`) and replayed into each actor update, so a made basket is
+  worth more than the single gradient step it used to get before being
+  discarded.
 - **Curriculum** — balls spawn inside a radius of the rim that starts small and
   grows, one-way, whenever the rolling accuracy clears a threshold
   (`CONFIG.curriculum`). The far court is where shots are both hardest to hit
