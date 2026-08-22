@@ -1252,7 +1252,11 @@ class SceneManager {
   constructor() {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x222222);
-    this.scene.fog = new THREE.Fog(0x222222, 50, 150);
+    // No fog. It faded to the background colour from 50ft out, which on a
+    // 94ft court meant the far half of the floor and the whole far hoop were
+    // washed toward flat grey — in the player's view and, more to the point,
+    // in the 96px one the agent is trained on. The court is an indoor space
+    // the length of a room; nothing in it is far enough away for haze.
 
     this.camera = new THREE.PerspectiveCamera(
       45,
