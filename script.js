@@ -73,6 +73,40 @@ const CONFIG = {
   // once either way, so this trades the size of each Adam step against how many
   // of them a batch buys.
   actorMinibatch: 32,
+  // The launch envelope: what the actor's tanh-bounded 3-vector means in
+  // ft/s. action[0] and action[1] map linearly onto [fwdMin, fwdMax] and
+  // [upMin, upMax], action[2] onto +/-side.
+  //
+  // These were inline constants working out to fwd 0-50, up 10-45 and side
+  // +/-10 ft/s, and all three were far wider than the physics needs. That
+  // costs accuracy directly, because the exploration noise is a fixed fraction
+  // of the action range: at the exploration floor every shot carries
+  // +/-0.075 of action, which against the old fwd range was +/-1.9ft/s of
+  // launch speed — roughly a 10% speed error on a mid-range shot, when a make
+  // wants single-digit percent.
+  //
+  // The side channel was the worst of the three. launch() already aims the
+  // shot down dirToHoop, so action[2] is only ever a correction, yet it spanned
+  // +/-10ft/s — over a ~1.4s flight the noise alone threw the ball more than a
+  // foot sideways, against a rim that leaves ~0.35ft of room around the ball.
+  //
+  // Narrowing the ranges onto the band the physics actually uses multiplies
+  // the effective resolution of the action against the same noise. Modelled
+  // over the spawn distribution (the best action available to any policy, with
+  // the noise added to it), the ceiling on accuracy goes 27% -> 56% at the
+  // current 0.15 floor and 61% -> 85% at 0.05. Reach is unchanged: every spawn
+  // that had a swish available under the old envelope still has one, checked
+  // per distance band down to 2ft.
+  //
+  // Scalars rather than pairs so every bound is reachable from a
+  // tools/hpsearch `--set launch.fwdMax=34` overlay.
+  launch: {
+    fwdMin: 3,
+    fwdMax: 30,
+    upMin: 13,
+    upMax: 39,
+    side: 3
+  },
   ipd: 0.2067,
   visionFov: 60,
   groups: { court: 1, ball: 2 },
@@ -771,7 +805,9 @@ class Court {
     // used to be, because at 0.1ft the balls went straight through it.
     //
     // cannon steps at a fixed 1/60s and actions are clamped to [-1, 1], so a
-    // ball leaves the launcher at up to 51ft/s — 0.85ft of travel per step. A
+    // ball leaves the launcher at up to the corner of CONFIG.launch's envelope
+    // — 49ft/s, or 0.82ft of travel per step. (This was 51ft/s before the
+    // envelope was narrowed, so the margin below only got wider.) A
     // sphere is only stopped if some step samples it before its center passes
     // the box's midplane; past that, the narrowphase finds the *back* face
     // closest and resolves the overlap out the back. That budget is
@@ -1084,14 +1120,22 @@ class Ball {
     dirToHoop.normalize();
     const dirSide = new THREE.Vector3().crossVectors(UP, dirToHoop).normalize();
 
-    const magFwd = (action[0] + 1) * 50;
-    const magUp = (action[1] + 1) * 35 + 20;
-    const magSide = action[2] * 20;
+    // The action is a launch *velocity* in CONFIG.launch's envelope, converted
+    // to an impulse here. Writing the envelope in ft/s rather than in impulse
+    // units keeps it in the same units as the rest of the world (the court is
+    // in feet, gravity is 32.2ft/s^2), so the numbers can be checked against
+    // the physics instead of against the ball's mass.
+    const L = CONFIG.launch;
+    const lerp = (lo, hi, a) => lo + ((a + 1) / 2) * (hi - lo);
+    const vFwd = lerp(L.fwdMin, L.fwdMax, action[0]);
+    const vUp = lerp(L.upMin, L.upMax, action[1]);
+    const vSide = action[2] * L.side;
 
+    const m = this.body.mass;
     const impulse = new THREE.Vector3()
-      .add(dirToHoop.multiplyScalar(magFwd))
-      .add(new THREE.Vector3(0, 1, 0).multiplyScalar(magUp))
-      .add(dirSide.multiplyScalar(magSide));
+      .add(dirToHoop.multiplyScalar(vFwd * m))
+      .add(new THREE.Vector3(0, 1, 0).multiplyScalar(vUp * m))
+      .add(dirSide.multiplyScalar(vSide * m));
 
     this.body.wakeUp();
     this.body.applyImpulse(
