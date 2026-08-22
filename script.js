@@ -274,7 +274,7 @@ class Assets {
   constructor() {
     this.woodTexture = Assets.woodTexture();
     this.particleTexture = Assets.softParticleTexture();
-    this.ballColorMap = Assets.ballTexture();
+    this.ballSkin = Assets.ballTextures();
 
     this.floor = new THREE.MeshPhysicalMaterial({
       map: this.woodTexture,
@@ -333,15 +333,30 @@ class Assets {
     });
     this.highContrast = new THREE.MeshBasicMaterial({ color: 0xffffff });
     this.manualBall = new THREE.MeshStandardMaterial({
-      map: this.ballColorMap,
+      map: this.ballSkin.map,
+      bumpMap: this.ballSkin.bumpMap,
+      bumpScale: 0.012,
       color: 0xffffff,
-      roughness: 0.4,
-      metalness: 0.1
+      // Leather, not plastic: rough enough to kill the specular hotspot the
+      // old 0.4 left sitting on top of the ball, and not metallic at all.
+      roughness: 0.78,
+      metalness: 0.0
     });
+    // The batch carried no texture at all — a flat orange sphere — so a
+    // thousand balls on the floor read as gumballs. It gets the same skin as
+    // the manual ball.
+    //
+    // color is white rather than orange because BallField tints each instance
+    // through setColorAt, and instance colour multiplies both the material
+    // colour and the map. Leaving it orange would multiply the orange in the
+    // map by orange again and turn the batch to rust.
     this.batchBall = new THREE.MeshStandardMaterial({
-      color: 0xe66700,
-      roughness: 0.4,
-      metalness: 0.1
+      map: this.ballSkin.map,
+      bumpMap: this.ballSkin.bumpMap,
+      bumpScale: 0.012,
+      color: 0xffffff,
+      roughness: 0.78,
+      metalness: 0.0
     });
     // Per-instance tints multiplied over batchBall's color. Balls that have
     // finished their shot stay on the court until the next batch spawns —
@@ -426,26 +441,167 @@ class Assets {
     return new THREE.CanvasTexture(canvas);
   }
 
-  static ballTexture() {
-    const cvs = document.createElement("canvas");
-    cvs.width = 512;
-    cvs.height = 512;
-    const ctx = cvs.getContext("2d");
-    ctx.fillStyle = "#C85A17";
-    ctx.fillRect(0, 0, 512, 512);
-    ctx.fillStyle = "rgba(0,0,0,0.1)";
-    for (let i = 0; i < 5000; i++) {
-      ctx.beginPath();
-      ctx.arc(
-        Math.random() * 512,
-        Math.random() * 512,
-        1 + Math.random() * 2,
-        0,
-        Math.PI * 2
-      );
-      ctx.fill();
+  // Deterministic generator for the procedural textures.
+  //
+  // Deliberately not Math.random(): tools/hpsearch replaces Math.random with a
+  // seeded stream so two configs see identical spawns, and texture generation
+  // runs during App construction — so every draw taken while painting a ball
+  // shifts every spawn in the training run that follows. On its own generator,
+  // what the balls look like cannot move what the agent sees, and the texture
+  // comes out identical on every load instead of freshly random each time.
+  static _texRandom(seed) {
+    let s = seed >>> 0;
+    return () => {
+      s = (s + 0x6d2b79f5) >>> 0;
+      let t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // The ball skin: an equirectangular colour map and a matching bump map.
+  //
+  // The old texture was a flat orange field with 5000 dark dots scattered over
+  // it. Two things were missing, and they are the two things that actually say
+  // "basketball": the seams, and the fact that the surface is pebbled leather
+  // rather than paint.
+  //
+  // 1024x512 rather than square because SphereGeometry's UVs are
+  // equirectangular — u wraps a full 360 degrees of longitude, v covers 180 of
+  // latitude — so a 2:1 map is the one that comes out with roughly square
+  // texels at the equator.
+  //
+  // Seams: the 8-panel layout is one great circle around the equator plus two
+  // more through the poles, 90 degrees apart, which in this projection is a
+  // horizontal line at v = 0.5 and four vertical lines a quarter-turn apart.
+  // Drawn straight, that reads as a beach ball. Real panels S-bend across the
+  // equator, so each pole-to-pole seam is displaced by sin(2*pi*v): zero at
+  // both poles and at the equator, maximum a quarter of the way to each. Every
+  // seam takes the same displacement, so the eight panels stay congruent.
+  //
+  // The bump map carries the same geometry inverted — pebbles raised, seams cut
+  // in as grooves — which is what makes the grain catch the light instead of
+  // reading as printed-on speckle.
+  static ballTextures() {
+    const W = 1024;
+    const H = 512;
+    const rnd = Assets._texRandom(0x9e3779b9);
+
+    const colour = document.createElement("canvas");
+    colour.width = W;
+    colour.height = H;
+    const c = colour.getContext("2d");
+    const bump = document.createElement("canvas");
+    bump.width = W;
+    bump.height = H;
+    const b = bump.getContext("2d");
+
+    c.fillStyle = "#c25f21";
+    c.fillRect(0, 0, W, H);
+    // Mid grey is "flat" for a bump map: the grain has to be able to sit both
+    // above and below the surface.
+    b.fillStyle = "#808080";
+    b.fillRect(0, 0, W, H);
+
+    // Low-frequency tone variation, so the leather is not one flat orange.
+    for (let i = 0; i < 90; i++) {
+      const x = rnd() * W;
+      const y = rnd() * H;
+      const r = 60 + rnd() * 190;
+      const g = c.createRadialGradient(x, y, 0, x, y, r);
+      const warm = rnd() > 0.5;
+      g.addColorStop(0, warm ? "rgba(226,124,48,0.10)" : "rgba(150,60,14,0.10)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      c.fillStyle = g;
+      c.beginPath();
+      c.arc(x, y, r, 0, Math.PI * 2);
+      c.fill();
     }
-    return new THREE.CanvasTexture(cvs);
+
+    // Pebble grain. Each pebble is a dot with a lit top-left and a shadowed
+    // bottom-right, which is what the bump map turns into relief.
+    //
+    // Two corrections for the projection, both of which matter because the
+    // grain is the finest detail on the ball and distortion in it is obvious:
+    //
+    //  - latitude is drawn as acos(1 - 2u)/pi rather than uniformly, because
+    //    equal areas of this map are not equal areas of the sphere. Sampling
+    //    the map uniformly piles pebbles up at the poles, where the map is
+    //    squeezed into almost no sphere at all;
+    //  - each pebble is stretched horizontally by 1/sin(latitude), the same
+    //    factor the projection is about to squeeze it by, so it arrives on the
+    //    ball round instead of as a thin vertical sliver.
+    for (let i = 0; i < 42000; i++) {
+      const v = Math.acos(1 - 2 * rnd()) / Math.PI;
+      const y = v * H;
+      const x = rnd() * W;
+      const r = 0.7 + rnd() * 1.4;
+      // Capped: at the pole itself the factor is unbounded.
+      const rx = r / Math.max(0.12, Math.sin(Math.PI * v));
+      const ellipse = (ctx, cx, cy, sx, sy) => {
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, sx, sy, 0, 0, Math.PI * 2);
+        ctx.fill();
+      };
+
+      c.fillStyle =
+        rnd() > 0.5
+          ? `rgba(255,186,126,${0.04 + rnd() * 0.08})`
+          : `rgba(74,28,6,${0.05 + rnd() * 0.12})`;
+      ellipse(c, x, y, rx, r);
+
+      // Kept deliberately gentle. Leather grain is a shallow texture; at the
+      // contrast this started out with, the bump map alone turned the ball
+      // into orange peel.
+      b.fillStyle = `rgba(255,255,255,${0.05 + rnd() * 0.10})`;
+      ellipse(b, x - rx * 0.22, y - r * 0.22, rx, r);
+      b.fillStyle = `rgba(0,0,0,${0.05 + rnd() * 0.10})`;
+      ellipse(b, x + rx * 0.3, y + r * 0.3, rx * 0.72, r * 0.72);
+    }
+
+    // Seams.
+    const bow = W * 0.045;
+    const seam = (ctx, colourStop, width) => {
+      ctx.strokeStyle = colourStop;
+      ctx.lineWidth = width;
+      ctx.lineCap = "round";
+      // Equator.
+      ctx.beginPath();
+      ctx.moveTo(0, H / 2);
+      ctx.lineTo(W, H / 2);
+      ctx.stroke();
+      // Four pole-to-pole seams. Each is drawn three times, one period of the
+      // map to either side, so a seam whose S-bend carries it over the u = 0
+      // edge still meets itself where the texture wraps.
+      for (const u of [0, 0.25, 0.5, 0.75]) {
+        for (const shift of [-W, 0, W]) {
+          ctx.beginPath();
+          for (let y = 0; y <= H; y += 4) {
+            const x =
+              u * W + shift + bow * Math.sin((2 * Math.PI * y) / H);
+            if (y === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+      }
+    };
+    // A hint of raised welt either side of the groove, then the groove itself.
+    seam(c, "rgba(70,26,4,0.55)", 13);
+    seam(c, "#20120a", 7);
+    seam(b, "rgba(255,255,255,0.35)", 13);
+    seam(b, "#202020", 7);
+
+    const map = new THREE.CanvasTexture(colour);
+    const bumpMap = new THREE.CanvasTexture(bump);
+    // u wraps all the way around the ball; v runs pole to pole and must not.
+    for (const t of [map, bumpMap]) {
+      t.wrapS = THREE.RepeatWrapping;
+      t.wrapT = THREE.ClampToEdgeWrapping;
+      t.anisotropy = 4;
+    }
+    return { map, bumpMap };
   }
 }
 
