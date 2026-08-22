@@ -763,8 +763,6 @@ class CNNAgent {
     this.learningRate = learningRate;
     this.batchSize = batchSize;
     this.l2Reg = tf.regularizers.l2({ l2 });
-    // Input geometry, derived from CONFIG so the network and all tensor
-    // reshapes track the vision resolution. Channels is 2 (stereo L/R).
     this.visionW = CONFIG.visionWidth;
     this.visionH = CONFIG.visionHeight;
     this.channels = 2;
@@ -775,21 +773,9 @@ class CNNAgent {
       CONFIG.replay.enabled && CONFIG.replay.capacity > 0
         ? new ReplayBuffer(CONFIG.replay.capacity, this.frameSize)
         : null;
-    // The pending batch, set by store() and consumed by train(). One object
-    // for the whole batch, not one per sample.
     this.memory = null;
   }
 
-  // Shared conv stack: conv(8) -> conv(16) -> flatten -> dense(64).
-  // Layer indices [0],[1] are the two conv layers in BOTH nets — the weight
-  // sync in train() depends on that alignment.
-  //
-  // denseReg is null for the actor: dense(64) and the output head are the only
-  // trainable parts of the policy, and L2 on them pulls the policy toward
-  // constant zero output — i.e. the same shot from every position — which
-  // competes directly with an already-weak improvement signal. The critic keeps
-  // L2 everywhere, and since the critic owns the conv backbone the filters stay
-  // regularized regardless.
   _convBase(model, denseReg = this.l2Reg) {
     model.add(
       tf.layers.conv2d({
@@ -823,29 +809,16 @@ class CNNAgent {
   _buildActor() {
     const m = tf.sequential();
     this._convBase(m, null);
-    // The critic owns the shared conv backbone: train() copies the critic's
-    // conv weights into the actor after every batch. Freeze the actor's two
-    // conv layers so the actor update doesn't waste work computing gradients
-    // that get overwritten, and so the actor's dense head trains against a
-    // stable feature extractor.
-    m.layers[0].trainable = false;
-    m.layers[1].trainable = false;
-    // 2 * ACTION_DIM linear outputs, not ACTION_DIM tanh ones: the first half
-    // is the mean of the action distribution (squashed by tanh in _headSplit,
-    // not here, so the second half stays unsquashed) and the second half is its
-    // log standard deviation. Keeping it a single sequential dense layer rather
-    // than two heads keeps the actor serializable through EXPORT POLICY.
+    // Unfreeze conv layers: let the policy learn end-to-end visual representations
+    m.layers[0].trainable = true;
+    m.layers[1].trainable = true;
+
     m.add(tf.layers.dense({ units: 2 * ACTION_DIM }));
     m.compile({
       optimizer: tf.train.adam(this.learningRate),
       loss: "meanSquaredError"
     });
-    // Start the spread at CONFIG.policy.logStdInit. The layer's bias is zeros
-    // by default, which would open at std 1 — a policy sampling almost
-    // uniformly across the whole action range, for as long as it took the
-    // gradient to pull the bias back down.
-    // setWeights assigns into the layer's existing variables, so everything
-    // created here is disposable once it returns.
+
     tf.tidy(() => {
       const head = m.layers[m.layers.length - 1];
       const [kernel, bias] = head.getWeights();
@@ -859,12 +832,6 @@ class CNNAgent {
     return m;
   }
 
-  // Split the actor's six raw outputs into (mean, logStd, std).
-  //
-  // tanh on the mean keeps it inside the action range the launcher accepts;
-  // logStd is clipped rather than squashed, so its gradient is exactly zero
-  // outside the range instead of merely small — which is what stops a policy
-  // that is learning nothing from drifting the spread out forever.
   _headSplit(raw) {
     const mean = tf.tanh(raw.slice([0, 0], [-1, ACTION_DIM]));
     const logStd = raw
@@ -884,34 +851,14 @@ class CNNAgent {
     return m;
   }
 
-  // One standard normal, Box-Muller. Built on Math.random so a seeded run
-  // (tools/hpsearch replaces Math.random) still reproduces exactly.
   static _gauss() {
-    // u must be non-zero for the log; Math.random() can return exactly 0.
     const u = 1 - Math.random();
     const v = Math.random();
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
   }
 
-  // pixelDataBatch: Float32Array of size count * frameSize (frameSize = W*H*2).
-  //
-  // Actions are sampled from the policy's own Gaussian rather than perturbed by
-  // an external schedule, so there is no noise scale to pass any more — the
-  // spread is whatever the policy asked for at that state.
-  //
-  // The first greedyCount actions are the distribution's mean instead of a draw
-  // from it. Those balls are the batch's eval sample (CONFIG.evalBalls): they
-  // measure the policy itself, while the rest carry the exploration that
-  // generates the batch's variety. Taking them off the front rather than at
-  // random keeps the split stable across batches, so the eval rate is a fixed
-  // sample of the state distribution rather than a fresh one every time.
-  //
-  // Records the batch's mean standard deviation on the agent, so the spread the
-  // policy has settled on can be read off without a second forward pass.
   predictBatch(pixelDataBatch, greedyCount = 0) {
     return tf.tidy(() => {
-      // Derive the batch count from the data length instead of assuming a fixed
-      // batch size, so a partial or resized batch reshapes correctly.
       const count = pixelDataBatch.length / this.frameSize;
       const stateTensor = tf.tensor(pixelDataBatch, [
         count,
@@ -927,19 +874,12 @@ class CNNAgent {
       for (let i = 0; i < stdData.length; i++) stdSum += stdData[i];
       this.lastMeanStd = stdData.length ? stdSum / stdData.length : 0;
 
-      // Clamp to [-1, 1]: the mean is tanh-bounded but a sample is not, and
-      // these actions are later used as the targets whose likelihood the actor
-      // is trained on, so out-of-range values would be unreachable goals.
       const clamp = (v) => Math.max(-1, Math.min(1, v));
       const actions = [];
       for (let i = 0; i < count; i++) {
         const a = [];
         for (let k = 0; k < ACTION_DIM; k++) {
           const j = i * ACTION_DIM + k;
-          // The draw happens either way: scaling it to zero rather than
-          // skipping the call keeps the RNG stream identical whatever
-          // greedyCount is, so a seeded run (tools/hpsearch) stays comparable
-          // to one with a different eval split.
           const g = CNNAgent._gauss();
           const spread = i < greedyCount ? 0 : stdData[j];
           a.push(clamp(meanData[j] + spread * g));
@@ -960,25 +900,22 @@ class CNNAgent {
       ]);
       for (let i = 0; i <= 3; i++) t = this.actor.layers[i].apply(t);
       const dense64 = t;
-      // The head is six wide now, but the activation panel draws the three
-      // action channels — so hand it the mean, post-tanh, which is what the
-      // three-output head used to return.
       const { mean } = this._headSplit(this.actor.layers[4].apply(dense64));
       return { dense: dense64.dataSync(), output: mean.dataSync() };
     });
   }
 
-  // Takes the batch whole: states is one contiguous Float32Array holding
-  // count * frameSize pixels in the same order as actions and rewards. Storing
-  // per-sample slices instead meant a full extra copy of the batch here and
-  // another in train() to concatenate them back — 150MB of copying per batch
-  // at batchSize 1024, for data that arrives contiguous already.
   store(states, actions, rewards) {
     this.memory = { states, actions, rewards, count: actions.length };
   }
 
-  // Trains critic on returns, then actor on advantage-positive samples.
-  // Returns the critic loss (or null if nothing to train on).
+  // Weight only positive-advantage transitions; zero out misses and sub-baseline actions
+  _advantageWeight(advantage, advMean, advStd) {
+    if (advantage <= 0) return 0;
+    const z = advantage / advStd;
+    return Math.min(CONFIG.advantageClip, Math.exp(z / CONFIG.advantageTemp));
+  }
+
   async train() {
     if (!this.memory) return null;
     const { states, actions, rewards, count: batchSize } = this.memory;
@@ -996,22 +933,9 @@ class CNNAgent {
       epochs: CONFIG.criticEpochs,
       verbose: 0
     });
-    // Report the last epoch's loss, so the number on the dashboard is the
-    // critic's error after the update however many passes it took.
     const losses = criticHistory.history.loss;
     const loss = losses && losses.length ? losses[losses.length - 1] : 0;
 
-    // Actor: regress toward the actions taken, weighted by how far each beat
-    // the critic's value estimate.
-    //
-    // This replaces a hard `advantage > 0` filter that trained on the better
-    // half of the batch with every surviving sample weighted equally. That
-    // filter throws away the magnitude of the advantage entirely, so a shot
-    // that beat the baseline by a hair pulled exactly as hard as one that swept
-    // the net — the regression target collapsed toward the unweighted mean of
-    // roughly half the actions, which is close to the mean of all of them. The
-    // result was a policy that barely varied with the input image. Exponential
-    // weighting keeps every sample but lets the genuinely good ones dominate.
     const values = this.critic.predict(stateTensor);
     const advantages = rewardTensor.sub(values);
     const advantageData = advantages.dataSync();
@@ -1033,22 +957,9 @@ class CNNAgent {
       );
     const weightTensor = tf.tensor1d(weightData);
 
-    // Sync the shared conv layers (critic -> actor) BEFORE fitting the actor.
-    // The actor's conv layers are frozen, so actor.fit() only adjusts its dense
-    // head — and that head should be trained against the same features the
-    // actor will use at inference. Syncing after the fit would instead train
-    // the head on the previous batch's stale features, then swap the backbone
-    // out from under it.
-    tf.tidy(() => {
-      for (let i = 0; i < 2; i++)
-        this.actor.layers[i].setWeights(this.critic.layers[i].getWeights());
-    });
-
+    // Train the actor end-to-end across its conv backbone and dense head
     this._fitActorWeighted(stateTensor, actionTensor, weightTensor);
 
-    // Replay the best shots the agent has ever taken, then offer this batch's
-    // best to the buffer. Fresh first so the buffer's contribution is measured
-    // against a head that has already seen the current batch.
     this._replayPass(advMean, advStd);
     this._admitToReplay(states, actions, rewards, advantageData);
 
@@ -1062,24 +973,6 @@ class CNNAgent {
     return loss;
   }
 
-  // Weight an advantage the same way the fresh batch's were, so replayed
-  // samples compete on the current batch's scale rather than on their own.
-  _advantageWeight(advantage, advMean, advStd) {
-    const z = (advantage - advMean) / advStd;
-    return Math.min(CONFIG.advantageClip, Math.exp(z / CONFIG.advantageTemp));
-  }
-
-  // A second pass of the actor's objective over a draw from the replay
-  // buffer. It shares _fitActorWeighted, so replayed samples are fitted by
-  // the same advantage-weighted likelihood as the fresh batch — including
-  // the gradient on sigma, which they should contribute to as much as any
-  // other sample the policy is being judged on.
-  //
-  // The advantages are recomputed against the *current* critic rather than
-  // reused from when the shot was taken: the critic is what a sample's
-  // advantage is relative to, and it has moved since. A shot that beat a naive
-  // early critic by a mile may be unremarkable against a better one, and should
-  // stop pulling as hard when that happens.
   _replayPass(advMean, advStd) {
     if (!this.replay) return;
     const draw = this.replay.sample(CONFIG.replay.samplesPerBatch);
@@ -1112,12 +1005,6 @@ class CNNAgent {
     weights.dispose();
   }
 
-  // Offer this batch's highest-advantage shots to the buffer.
-  //
-  // Admission is by advantage rather than by reward: reward is dominated by
-  // shot distance, so ranking on it would fill the buffer with long makes and
-  // starve it of the close-range shots that are the only thing a policy this
-  // early can reliably repeat.
   _admitToReplay(states, actions, rewards, advantageData) {
     if (!this.replay) return;
     const n = rewards.length;
@@ -1127,26 +1014,13 @@ class CNNAgent {
     const take = Math.min(CONFIG.replay.admitPerBatch, n);
     for (let k = 0; k < take; k++) {
       const i = ranked[k];
-      this.replay.offer(states, actions, rewards[i], advantageData[i], i);
+      if (advantageData[i] > 0) {
+        this.replay.offer(states, actions, rewards[i], advantageData[i], i);
+      }
     }
   }
 
-  // One epoch of minibatch Adam over a per-sample advantage-weighted negative
-  // log-likelihood. model.fit() cannot do this: passing sampleWeight throws
-  // "Support sampleWeight is not implemented yet" in tfjs 4.x, so the update is
-  // driven explicitly. Minibatch size matches fit()'s default of 32 so the
-  // number of optimizer steps per batch is unchanged (CONFIG.actorMinibatch
-  // retunes it). Only trainableWeights are passed to minimize(), which already
-  // excludes the two frozen conv layers.
-  //
-  // The objective was a weighted squared error onto the action taken, which is
-  // the same thing as this likelihood at a fixed spread — so with sigma now
-  // part of the policy, keeping MSE would have trained the mean and left the
-  // spread with no gradient at all. Under the likelihood, a dimension whose
-  // high-advantage actions cluster tightly is fit better by a narrow Gaussian
-  // and sigma is pulled down; a dimension whose good actions are all over the
-  // place keeps a wide one. The log(sigma) term is what stops the trivial
-  // solution of shrinking sigma to nothing everywhere.
+  // Minibatch update with bounded sigma precision and weight-normalized loss
   _fitActorWeighted(states, actions, weights, minibatch = CONFIG.actorMinibatch) {
     const n = states.shape[0];
     const order = new Int32Array(n);
@@ -1166,16 +1040,22 @@ class CNNAgent {
         const xb = tf.gather(states, idx);
         const yb = tf.gather(actions, idx);
         const wb = tf.gather(weights, idx);
+
+        const weightSum = wb.sum().dataSync()[0];
+        if (weightSum <= 1e-6) return;
+
         this.actorOptimizer.minimize(
           () => {
             const raw = this.actor.apply(xb, { training: true });
             const { mean, logStd, std } = this._headSplit(raw);
-            // -log N(a | mean, std), dropping the constant 0.5*log(2*pi) per
-            // dimension: it shifts every sample's loss by the same amount and
-            // so contributes nothing to the gradient.
-            const z = yb.sub(mean).div(std);
+
+            // Floor std in the precision term to prevent 1/sigma^2 gradient explosion
+            const safeStd = std.clipByValue(0.1, 1.0);
+            const z = yb.sub(mean).div(safeStd);
             const perSample = z.square().mul(0.5).add(logStd).sum(1);
-            return perSample.mul(wb).mean();
+
+            // Normalize by sum of positive weights rather than batch size
+            return perSample.mul(wb).sum().div(tf.scalar(weightSum));
           },
           false,
           vars
@@ -1188,17 +1068,6 @@ class CNNAgent {
     await this.actor.save("downloads://basketball-agent-actor");
   }
 
-  // Load an actor written by saveActor(). The download produces two files — the
-  // topology JSON and its .weights.bin sidecar — and tf.io.browserFiles wants
-  // the JSON first, so it is picked out by extension here rather than trusting
-  // the order the file picker handed the pair over in.
-  //
-  // The weights are copied into the existing actor instead of swapping the
-  // loaded model in for it: this.actor carries state that a fresh
-  // deserialization does not — the two frozen conv layers, the compile, and the
-  // layer indices getActivations() reads — and setWeights assigns into the
-  // variables actorOptimizer is already bound to, so training resumes on the
-  // imported policy instead of on an optimizer that has never seen it.
   async loadActor(files) {
     const list = Array.from(files);
     const topology = list.find((f) => f.name.endsWith(".json"));
@@ -1214,10 +1083,6 @@ class CNNAgent {
     try {
       const source = loaded.getWeights();
       const target = this.actor.getWeights();
-      // Shape-check the whole set before assigning any of it. setWeights throws
-      // on the first mismatch, which on a partially compatible file would leave
-      // the actor holding half of each policy; a file exported under a
-      // different visionWidth/visionHeight or ACTION_DIM is exactly that case.
       if (source.length !== target.length)
         throw new Error(
           `Expected ${target.length} weight tensors, file has ${source.length}`
@@ -1233,11 +1098,6 @@ class CNNAgent {
       }
 
       this.actor.setWeights(source);
-      // The critic owns the shared conv backbone and copies it into the actor
-      // after every batch (see train()), so an imported actor whose filters the
-      // critic does not have would be overwritten by the untrained ones on the
-      // very first update — the import would appear to take and then silently
-      // undo itself. Push the filters the other way once, here.
       tf.tidy(() => {
         for (let i = 0; i < 2; i++)
           this.critic.layers[i].setWeights(this.actor.layers[i].getWeights());
