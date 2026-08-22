@@ -42,6 +42,11 @@ terminal reward, so there's no temporal credit assignment.
   best in the batch and shooting straight up through the net would be the
   easiest policy to learn.
 - **Exploration** — Gaussian-ish noise added to actions, annealed over training
+  so the agent explores widely early and exploits as it improves.
+- **Replay** — the highest-advantage shots are kept in a fixed-capacity buffer
+  (`CONFIG.replay`) and replayed into each actor update, so a made basket is
+  worth more than the single gradient step it used to get before being
+  discarded.
   so the agent explores widely early and exploits as it improves. A slice of
   each batch (`CONFIG.evalBalls`) is launched with the noise switched off, so
   the dashboard reports the policy's own accuracy next to the behaviour

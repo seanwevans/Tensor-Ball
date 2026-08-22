@@ -73,6 +73,30 @@ const CONFIG = {
   // once either way, so this trades the size of each Adam step against how many
   // of them a batch buys.
   actorMinibatch: 32,
+  // Self-imitation replay.
+  //
+  // train() ends with `this.memory = null`, so every shot the agent has ever
+  // taken is seen by exactly one gradient step and then thrown away. That is
+  // very expensive for the samples that matter: made baskets are a low
+  // single-digit percentage of a batch early on, they are the only samples
+  // carrying any information about what a good shot looks like, and each one
+  // gets a single weighted regression step before it is gone forever.
+  //
+  // Keep the best shots and replay them. The buffer is admitted to by
+  // advantage, not by reward, because reward is dominated by shot distance —
+  // a made three is worth more than a made layup regardless of which was the
+  // better decision from where the ball was standing.
+  //
+  // Costs a Float32Array of capacity * visionW * visionH * 2 * 4B, which is
+  // 37MB at these defaults — half a batch's state tensor.
+  replay: {
+    enabled: true,
+    capacity: 512,
+    // Best shots of each batch offered to the buffer.
+    admitPerBatch: 64,
+    // Shots drawn back out of it into each actor update.
+    samplesPerBatch: 128
+  },
   // The launch envelope: what the actor's tanh-bounded 3-vector means in
   // ft/s. action[0] and action[1] map linearly onto [fwdMin, fwdMax] and
   // [upMin, upMax], action[2] onto +/-side.
@@ -334,6 +358,85 @@ class Assets {
   }
 }
 
+// A fixed-capacity store of the highest-advantage shots the agent has taken,
+// for replaying into the actor update (see CONFIG.replay).
+//
+// States are kept in one flat Float32Array rather than as per-sample arrays,
+// matching how the batch arrives from VisionSystem: at 96px stereo a single
+// frame is 18432 floats, so per-sample slices would mean an allocation and a
+// copy per admitted shot, every batch, forever.
+//
+// Admission is "beat the weakest thing in here", which keeps the buffer at the
+// running top-`capacity` by advantage without sorting it.
+class ReplayBuffer {
+  constructor(capacity, frameSize) {
+    this.capacity = capacity;
+    this.frameSize = frameSize;
+    this.states = new Float32Array(capacity * frameSize);
+    this.actions = new Float32Array(capacity * 3);
+    this.rewards = new Float32Array(capacity);
+    this.priority = new Float32Array(capacity);
+    this.size = 0;
+  }
+
+  // Index of the weakest entry, or -1 while there is still room.
+  _weakest() {
+    if (this.size < this.capacity) return -1;
+    let worst = 0;
+    for (let i = 1; i < this.size; i++)
+      if (this.priority[i] < this.priority[worst]) worst = i;
+    return worst;
+  }
+
+  // states/actions are the batch's flat arrays; i indexes into them.
+  offer(states, actions, reward, priority, i) {
+    let slot;
+    if (this.size < this.capacity) slot = this.size++;
+    else {
+      slot = this._weakest();
+      if (priority <= this.priority[slot]) return false;
+    }
+    const f = this.frameSize;
+    this.states.set(states.subarray(i * f, (i + 1) * f), slot * f);
+    this.actions[slot * 3 + 0] = actions[i][0];
+    this.actions[slot * 3 + 1] = actions[i][1];
+    this.actions[slot * 3 + 2] = actions[i][2];
+    this.rewards[slot] = reward;
+    this.priority[slot] = priority;
+    return true;
+  }
+
+  // `count` distinct entries at random, as flat arrays ready for tf.tensor.
+  // Uniform rather than priority-weighted: the buffer is already the top of the
+  // distribution, and weighting the draw too would train the actor almost
+  // entirely on whichever handful of shots scored best.
+  sample(count) {
+    const n = Math.min(count, this.size);
+    if (n === 0) return null;
+    const idx = new Int32Array(this.size);
+    for (let i = 0; i < this.size; i++) idx[i] = i;
+    for (let i = 0; i < n; i++) {
+      const j = i + Math.floor(Math.random() * (this.size - i));
+      const t = idx[i];
+      idx[i] = idx[j];
+      idx[j] = t;
+    }
+    const f = this.frameSize;
+    const states = new Float32Array(n * f);
+    const actions = new Float32Array(n * 3);
+    const rewards = new Float32Array(n);
+    for (let k = 0; k < n; k++) {
+      const src = idx[k];
+      states.set(this.states.subarray(src * f, (src + 1) * f), k * f);
+      actions[k * 3 + 0] = this.actions[src * 3 + 0];
+      actions[k * 3 + 1] = this.actions[src * 3 + 1];
+      actions[k * 3 + 2] = this.actions[src * 3 + 2];
+      rewards[k] = this.rewards[src];
+    }
+    return { states, actions, rewards, count: n };
+  }
+}
+
 class CNNAgent {
   constructor({ learningRate, batchSize, l2 }) {
     this.learningRate = learningRate;
@@ -347,6 +450,10 @@ class CNNAgent {
     this.frameSize = this.visionW * this.visionH * this.channels;
     this.actor = this._buildActor();
     this.critic = this._buildCritic();
+    this.replay =
+      CONFIG.replay.enabled && CONFIG.replay.capacity > 0
+        ? new ReplayBuffer(CONFIG.replay.capacity, this.frameSize)
+        : null;
     // The pending batch, set by store() and consumed by train(). One object
     // for the whole batch, not one per sample.
     this.memory = null;
@@ -538,13 +645,12 @@ class CNNAgent {
     const advStd = Math.sqrt(advVar / batchSize) || 1;
 
     const weightData = new Float32Array(batchSize);
-    for (let i = 0; i < batchSize; i++) {
-      const z = (advantageData[i] - advMean) / advStd;
-      weightData[i] = Math.min(
-        CONFIG.advantageClip,
-        Math.exp(z / CONFIG.advantageTemp)
+    for (let i = 0; i < batchSize; i++)
+      weightData[i] = this._advantageWeight(
+        advantageData[i],
+        advMean,
+        advStd
       );
-    }
     const weightTensor = tf.tensor1d(weightData);
 
     // Sync the shared conv layers (critic -> actor) BEFORE fitting the actor.
@@ -560,6 +666,12 @@ class CNNAgent {
 
     this._fitActorWeighted(stateTensor, actionTensor, weightTensor);
 
+    // Replay the best shots the agent has ever taken, then offer this batch's
+    // best to the buffer. Fresh first so the buffer's contribution is measured
+    // against a head that has already seen the current batch.
+    this._replayPass(advMean, advStd);
+    this._admitToReplay(states, actions, rewards, advantageData);
+
     stateTensor.dispose();
     actionTensor.dispose();
     rewardTensor.dispose();
@@ -568,6 +680,71 @@ class CNNAgent {
     weightTensor.dispose();
     this.memory = null;
     return loss;
+  }
+
+  // Weight an advantage the same way the fresh batch's were, so replayed
+  // samples compete on the current batch's scale rather than on their own.
+  _advantageWeight(advantage, advMean, advStd) {
+    const z = (advantage - advMean) / advStd;
+    return Math.min(CONFIG.advantageClip, Math.exp(z / CONFIG.advantageTemp));
+  }
+
+  // A second weighted-regression pass over a draw from the replay buffer.
+  //
+  // The advantages are recomputed against the *current* critic rather than
+  // reused from when the shot was taken: the critic is what a sample's
+  // advantage is relative to, and it has moved since. A shot that beat a naive
+  // early critic by a mile may be unremarkable against a better one, and should
+  // stop pulling as hard when that happens.
+  _replayPass(advMean, advStd) {
+    if (!this.replay) return;
+    const draw = this.replay.sample(CONFIG.replay.samplesPerBatch);
+    if (!draw) return;
+
+    const states = tf.tensor(draw.states, [
+      draw.count,
+      this.visionH,
+      this.visionW,
+      this.channels
+    ]);
+    const actions = tf.tensor2d(draw.actions, [draw.count, 3]);
+    const values = this.critic.predict(states);
+    const valueData = values.dataSync();
+
+    const weightData = new Float32Array(draw.count);
+    for (let i = 0; i < draw.count; i++)
+      weightData[i] = this._advantageWeight(
+        draw.rewards[i] - valueData[i],
+        advMean,
+        advStd
+      );
+    const weights = tf.tensor1d(weightData);
+
+    this._fitActorWeighted(states, actions, weights);
+
+    states.dispose();
+    actions.dispose();
+    values.dispose();
+    weights.dispose();
+  }
+
+  // Offer this batch's highest-advantage shots to the buffer.
+  //
+  // Admission is by advantage rather than by reward: reward is dominated by
+  // shot distance, so ranking on it would fill the buffer with long makes and
+  // starve it of the close-range shots that are the only thing a policy this
+  // early can reliably repeat.
+  _admitToReplay(states, actions, rewards, advantageData) {
+    if (!this.replay) return;
+    const n = rewards.length;
+    const ranked = new Array(n);
+    for (let i = 0; i < n; i++) ranked[i] = i;
+    ranked.sort((a, b) => advantageData[b] - advantageData[a]);
+    const take = Math.min(CONFIG.replay.admitPerBatch, n);
+    for (let k = 0; k < take; k++) {
+      const i = ranked[k];
+      this.replay.offer(states, actions, rewards[i], advantageData[i], i);
+    }
   }
 
   // One epoch of minibatch Adam over a per-sample weighted MSE. model.fit()
