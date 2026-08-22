@@ -1080,9 +1080,30 @@ class CNNAgent {
   }
 
   // Weight only positive-advantage transitions; zero out misses and sub-baseline actions
+  // How hard a sample pulls: the gate is whether the shot beat the critic, the
+  // weight is how far it beat the batch.
+  //
+  // Centred on the batch's own mean advantage, which is what makes the weight
+  // a comparison between shots rather than a reading of the critic's current
+  // calibration. Uncentred, z carries advMean/advStd — measured wandering
+  // between -0.34 and +0.37 batch to batch — so every weight in the batch is
+  // multiplied by exp(advMean / (advStd * advantageTemp)) for no reason but
+  // how far the value head happens to sit from the returns.
+  //
+  // That factor is uniform across the batch, and _fitActorWeighted normalizes
+  // by the sum of the weights, so most of it divides straight back out. The
+  // one place it survives is the clip: weights pinned at CONFIG.advantageClip
+  // are equal weights, so a batch pushed into the clip together is a batch
+  // that has stopped being weighted at all — and it is the lagging critic, the
+  // case where advMean/advStd is largest, that pushes it there. The clip
+  // rarely binds today (nought to one sample in most batches), so this is
+  // insurance rather than a fix for something currently on fire.
+  //
+  // It also gives advMean a job again. It was still being passed in and
+  // ignored, which is the shape of a term dropped by accident.
   _advantageWeight(advantage, advMean, advStd) {
     if (advantage <= 0) return 0;
-    const z = advantage / advStd;
+    const z = (advantage - advMean) / advStd;
     return Math.min(CONFIG.advantageClip, Math.exp(z / CONFIG.advantageTemp));
   }
 
