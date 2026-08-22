@@ -101,7 +101,22 @@ const CONFIG = {
   // upward velocity: a ball rattling on the rim from above can clip the sensor
   // while bouncing back up. Require real ascent, and require the ball to be in
   // the column of the hoop rather than hanging off its edge.
-  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55 }
+  //
+  // scoreRadius is how close to the rim's axis the ball's centre has to be, at
+  // the moment it crosses the rim's plane going down, for the shot to have gone
+  // through the hoop. It is the hole minus the ball: the rim is a torus of
+  // radius 0.75 and tube 0.05, so the clear opening is 0.70, and a ball of
+  // radius 0.40 only fits while its centre is within 0.30 of the axis.
+  //
+  // Nothing enforced this before. Scoring was a contact against the scoring
+  // sensor, and that sensor is a Cylinder(0.5) against a Sphere(0.4), so cannon
+  // reported a hit as soon as the ball's centre came within ~0.9ft of the axis
+  // — more than a foot of slack around a hole the ball barely fits through.
+  // Measured over twelve batches, 75% of the shots credited as baskets had
+  // their centre further than 0.30ft from the axis when they were credited, and
+  // the median was 0.63ft: balls bouncing off the outside of the rim, each one
+  // collecting +25 and the largest positive advantage in the batch.
+  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55, scoreRadius: 0.3 }
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -919,20 +934,67 @@ class BallField {
   }
 }
 
-// What a touch of the scoring sensor means, decided by the direction of travel:
-// "down" through the rim is a basket, "up" through it is an illegal entry from
-// below, and "none" is a graze that is neither — a ball hanging off the rim's
-// edge or bouncing back up off it after coming down from above.
+// Whether a touch of the scoring sensor is the ball coming up through the rim
+// from underneath. It takes more than an upward velocity: a ball rattling on
+// the rim from above can clip the sensor while bouncing back up, so require
+// real ascent and require the ball to be in the column of the hoop rather than
+// hanging off its edge.
+//
+// The other direction is no longer decided here. A sensor touch is a poor proxy
+// for a basket — see CONFIG.hoopEntry.scoreRadius — so baskets are detected
+// geometrically in trackHoopPass instead, and the sensor now only answers this
+// one question.
 //
 // Shared by the batch balls and the manual ball so both agree on what counts.
-function classifyHoopCrossing(body, court) {
+function isEntryFromBelow(body, court) {
   const vy = body.velocity.y;
-  if (vy < 0) return "down";
-  if (vy <= CONFIG.hoopEntry.minAscentSpeed) return "none";
+  if (vy <= CONFIG.hoopEntry.minAscentSpeed) return false;
   const dx = body.position.x - court.rimPositionCannon.x;
   const dz = body.position.z - court.rimPositionCannon.z;
   const r = CONFIG.hoopEntry.columnRadius;
-  return dx * dx + dz * dz <= r * r ? "up" : "none";
+  return dx * dx + dz * dz <= r * r;
+}
+
+// Did the ball just fall through the hoop? Called once per frame per live ball,
+// for anything carrying the {body, scored, enteredFromBelow, prev*} shape —
+// the batch balls and the manual ball both do.
+//
+// This replaces "the ball touched the scoring sensor going down". That test was
+// wrong in both directions of precision: the sensor is a whole foot wider than
+// the rim's opening, and cannon reports the contact once, at whatever point on
+// the way in the shapes first overlapped, which for a flat shot is not where
+// the ball crossed the rim.
+//
+// So find the crossing itself. The rim is a horizontal plane at rim.y; if the
+// ball was above it last frame and is below it now, solve for where it cut the
+// plane and ask whether that point is inside the hole. Interpolating rather
+// than sampling makes the answer independent of how far the ball travels in a
+// step, which at up to 0.8ft per step is otherwise most of the rim's diameter.
+//
+// A ball that has already come up through the hoop cannot score on the way back
+// down, matching the real rule: entering from below kills the ball. Without it
+// a shot fired straight up through the net collects the basket reward on its
+// own descent.
+function trackHoopPass(o, court) {
+  const p = o.body.position;
+  const px = o.prevX;
+  const py = o.prevY;
+  const pz = o.prevZ;
+  o.prevX = p.x;
+  o.prevY = p.y;
+  o.prevZ = p.z;
+
+  if (py === null || o.scored || o.enteredFromBelow) return;
+  const rim = court.rimPositionCannon;
+  // Descending crossing of the rim's plane, and only that: a ball still on its
+  // way up, or one that never reaches the rim's height, is not a candidate.
+  if (!(py >= rim.y && p.y < rim.y)) return;
+
+  const t = (py - rim.y) / (py - p.y);
+  const dx = px + (p.x - px) * t - rim.x;
+  const dz = pz + (p.z - pz) * t - rim.z;
+  const s = CONFIG.hoopEntry.scoreRadius;
+  if (dx * dx + dz * dz <= s * s) o.scored = true;
 }
 
 class Ball {
@@ -972,6 +1034,12 @@ class Ball {
     this.enteredFromBelow = false;
     this.hitBackboard = false;
     this.hitRim = false;
+    // Last frame's position, for the rim-plane crossing test in trackHoopPass.
+    // Null rather than the spawn point so the first frame of a shot cannot be
+    // read as a crossing from wherever the previous shot ended.
+    this.prevX = null;
+    this.prevY = null;
+    this.prevZ = null;
   }
 
   // Position at a random launch spot and mark active/visible.
@@ -1034,14 +1102,9 @@ class Ball {
 
   onContact(other, court) {
     if (other === court.scoringSensor) {
-      const crossing = classifyHoopCrossing(this.body, court);
-      // A ball that has already come up through the hoop cannot score on the
-      // way back down, matching the real rule: entering from below kills the
-      // ball. Without this a shot fired straight up through the net collects
-      // the basket reward on its own descent.
-      if (crossing === "up") this.enteredFromBelow = true;
-      else if (crossing === "down" && !this.enteredFromBelow)
-        this.scored = true;
+      // Baskets are decided in trackHoopPass; the sensor's only remaining job
+      // is catching the ball on its way up through the rim.
+      if (isEntryFromBelow(this.body, court)) this.enteredFromBelow = true;
     } else if (other === court.backboardBody) this.hitBackboard = true;
     else if (other === court.rimBody) this.hitRim = true;
   }
@@ -1667,6 +1730,9 @@ class TrainingArena {
         continue;
       }
       b.syncMesh();
+      // Before the retire check below, so a made shot ends on the frame it
+      // drops through rather than one frame later.
+      trackHoopPass(b, this.court);
       b.path.push(b.position.clone());
 
       const dist = b.body.position.distanceTo(this.hoopPosCannon);
@@ -1851,6 +1917,9 @@ class ManualBall {
     this.inProgress = false;
     this.scored = false;
     this.enteredFromBelow = false;
+    this.prevX = null;
+    this.prevY = null;
+    this.prevZ = null;
     const x = Math.random() * 42;
     const z = (Math.random() - 0.5) * 46;
     const y = 4.5 + Math.random() * 1.5;
@@ -1864,15 +1933,16 @@ class ManualBall {
 
   onContact(other, court) {
     if (other !== court.scoringSensor) return;
-    const crossing = classifyHoopCrossing(this.body, court);
-    if (crossing === "up") this.enteredFromBelow = true;
-    else if (crossing === "down" && !this.enteredFromBelow) this.scored = true;
+    if (isEntryFromBelow(this.body, court)) this.enteredFromBelow = true;
   }
 
-  update() {
+  update(court) {
     this.mesh.position.copy(this.body.position);
     this.mesh.quaternion.copy(this.body.quaternion);
     if (this.inProgress) {
+      // Only while a shot is live. Right-dragging the ball can carry it down
+      // through the rim's plane, which is a reposition, not a basket.
+      trackHoopPass(this, court);
       const isStopped = this.body.velocity.length() < 0.5;
       const isBelow = this.body.position.y < 1;
       const isOOB =
@@ -2138,7 +2208,7 @@ class App {
       }
     }
 
-    this.manual.update();
+    this.manual.update(this.court);
     this.sceneMgr.render();
   }
 }
