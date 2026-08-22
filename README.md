@@ -39,7 +39,11 @@ terminal reward, so there's no temporal credit assignment.
   best in the batch and shooting straight up through the net would be the
   easiest policy to learn.
 - **Exploration** — Gaussian-ish noise added to actions, annealed over training
-  so the agent explores widely early and exploits as it improves.
+  so the agent explores widely early and exploits as it improves. A slice of
+  each batch (`CONFIG.evalBalls`) is launched with the noise switched off, so
+  the dashboard reports the policy's own accuracy next to the behaviour
+  policy's — the two move independently, and only the first one is what the
+  agent has learned.
 
 The live dashboards show the agent's stereo input, the learned first-layer
 filters, dense-layer activations, the critic's batch loss, and running accuracy.
