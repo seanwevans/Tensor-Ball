@@ -40,6 +40,11 @@ terminal reward, so there's no temporal credit assignment.
   easiest policy to learn.
 - **Exploration** — Gaussian-ish noise added to actions, annealed over training
   so the agent explores widely early and exploits as it improves.
+- **Curriculum** — balls spawn inside a radius of the rim that starts small and
+  grows, one-way, whenever the rolling accuracy clears a threshold
+  (`CONFIG.curriculum`). The far court is where shots are both hardest to hit
+  and hardest to range — stereo disparity is sub-pixel out there — so opening
+  it up is something the policy earns rather than something it starts with.
 
 The live dashboards show the agent's stereo input, the learned first-layer
 filters, dense-layer activations, the critic's batch loss, and running accuracy.

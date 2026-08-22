@@ -60,6 +60,42 @@ const CONFIG = {
   visionFov: 60,
   groups: { court: 1, ball: 2 },
   rim: { x: 41.75, y: 10, z: 0 },
+  // Spawn-distance curriculum.
+  //
+  // Spawns are drawn from the whole half court from the first batch, and the
+  // far half of it is the worst possible place to start learning. Long shots
+  // are both the hardest to hit and the hardest to *see*: the README's own
+  // disparity arithmetic puts one pixel of stereo disparity at ~1.7px at 10ft
+  // and ~0.86px at 20ft, so past mid-range the second eye stops carrying
+  // usable depth — and conv1 (8x8, stride 4) throws away most of what is left.
+  // Modelled over the action space, the best accuracy available to any policy
+  // falls from ~51% at 0-10ft to ~25% at 30-50ft at the current noise floor.
+  //
+  // So the far court contributes samples that are near-unhittable, poorly
+  // ranged, and a permanent drag on the average — while the near court, where
+  // the signal is good, is only a fraction of each batch. Start close and open
+  // the court up as the policy earns it.
+  //
+  // Expansion is one-way. A curriculum that also contracts makes the reported
+  // accuracy non-comparable over time (the task gets easier exactly when the
+  // agent gets worse); one-way means any accuracy number is measured on a task
+  // at least as hard as every number before it.
+  //
+  // At maxRadius the disc covers the whole half court — the farthest corner is
+  // 47.7ft from the rim — so the spawn distribution at full radius is exactly
+  // the uniform-over-the-court one this replaces.
+  curriculum: {
+    enabled: true,
+    startRadius: 12,
+    maxRadius: 48,
+    // Rolling accuracy that has to be cleared before the radius grows.
+    expandAbove: 0.3,
+    // Growth per batch while above the threshold: 12ft -> 48ft in ~47 batches.
+    expandRate: 1.03,
+    // Shots that must be in the accuracy window before it is trusted to gate
+    // anything, so the radius cannot run away on one lucky early batch.
+    minSamples: 512
+  },
   // Which way the ball went through the hoop is the whole game, so the two
   // directions sit at opposite ends of the reward scale rather than a hair
   // apart. Dropping in from above is the only outcome worth learning. Sailing
@@ -941,9 +977,33 @@ class Ball {
   }
 
   // Position at a random launch spot and mark active/visible.
-  spawn() {
-    const x = Math.random() * 42;
-    const z = (Math.random() - 0.5) * 46;
+  //
+  // maxRadius caps how far from the rim the spot may be (the curriculum, see
+  // CONFIG.curriculum). Sampling is uniform-in-disc, rejected back into the
+  // court bounds, which gives a uniform distribution over the intersection of
+  // the two — so once the radius is large enough to contain the court the
+  // result is uniform over the court, identical to the unrestricted draw.
+  //
+  // The loop is bounded and falls back to a point on the rim-facing axis, so a
+  // radius that somehow admits no legal spot cannot hang the batch.
+  spawn(maxRadius = CONFIG.curriculum.maxRadius) {
+    const rim = CONFIG.rim;
+    let x = rim.x;
+    let z = rim.z;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const a = Math.random() * Math.PI * 2;
+      // sqrt keeps the draw uniform per unit area rather than crowding the
+      // centre, which would quietly make the curriculum's early batches all
+      // point-blank.
+      const r = Math.sqrt(Math.random()) * maxRadius;
+      x = rim.x + Math.cos(a) * r;
+      z = rim.z + Math.sin(a) * r;
+      if (x >= 0 && x <= 42 && Math.abs(z) <= 23) break;
+      if (attempt === 23) {
+        x = Math.max(0, rim.x - Math.min(maxRadius, 41.75));
+        z = rim.z;
+      }
+    }
     const y = 4.5 + Math.random() * 1.5;
     this.body.position.set(x, y, z);
     this.body.velocity.set(0, 0, 0);
@@ -1292,6 +1352,7 @@ class Dashboard {
     this.uiBaskets = document.getElementById("baskets");
     this.uiIllegal = document.getElementById("illegal-entries");
     this.uiAcc = document.getElementById("accuracy");
+    this.uiRadius = document.getElementById("spawn-radius");
     this.uiStatus = document.getElementById("status");
     this.uiBatch = document.getElementById("batch-progress");
 
@@ -1312,8 +1373,12 @@ class Dashboard {
     if (this.uiBatch) this.uiBatch.innerText = text;
   }
 
-  setStats({ accuracy, baskets, episodes, illegalEntries }) {
+  setStats({ accuracy, spawnRadius, baskets, episodes, illegalEntries }) {
     this.uiAcc.innerText = Math.round(accuracy * 100) + "%";
+    // The accuracy above is only readable next to the radius it was measured
+    // at, since the curriculum is what decides how hard the batch was.
+    if (this.uiRadius && spawnRadius != null)
+      this.uiRadius.innerText = spawnRadius.toFixed(1) + " ft";
     this.uiBaskets.innerText = baskets;
     this.uiEp.innerText = episodes;
     if (this.uiIllegal) this.uiIllegal.innerText = illegalEntries;
@@ -1558,6 +1623,12 @@ class TrainingArena {
     // which is 150MB of pointless copying per batch at batchSize 1024.
     this.batchPixels = null;
 
+    // Current curriculum radius. Starts small and only ever grows — see
+    // CONFIG.curriculum and _advanceCurriculum below.
+    this.spawnRadius = CONFIG.curriculum.enabled
+      ? CONFIG.curriculum.startRadius
+      : CONFIG.curriculum.maxRadius;
+
     this.episodeStats = { count: 0, baskets: 0, shots: 0, illegal: 0 };
     this.accuracyHistory = [];
     this.isTrainingStep = false;
@@ -1567,7 +1638,7 @@ class TrainingArena {
   // Position all balls but don't launch (initial state / warm-up).
   spawnAll() {
     this.field.setVisible(true);
-    for (const b of this.balls) b.spawn();
+    for (const b of this.balls) b.spawn(this.spawnRadius);
     this.field.flush();
     this.dashboard.setBatchProgress("Simulating...");
   }
@@ -1674,6 +1745,20 @@ class TrainingArena {
     return { reward: proximity, type: "miss" };
   }
 
+  // Open the court up once the policy is hitting at the current radius.
+  //
+  // Gated on the rolling accuracy rather than on a batch count, so a run that
+  // is not learning stays on the near court instead of being marched out to
+  // half court on a schedule. Growth is one-way: see CONFIG.curriculum.
+  _advanceCurriculum(rollingAcc) {
+    const c = CONFIG.curriculum;
+    if (!c.enabled) return;
+    if (this.spawnRadius >= c.maxRadius) return;
+    if (this.accuracyHistory.length < c.minSamples) return;
+    if (rollingAcc < c.expandAbove) return;
+    this.spawnRadius = Math.min(c.maxRadius, this.spawnRadius * c.expandRate);
+  }
+
   // Compute rewards, store transitions, train, then relaunch. Re-entrant-guarded.
   async finishBatch(manualMesh) {
     if (this.isTrainingStep) return;
@@ -1705,6 +1790,7 @@ class TrainingArena {
         : 0;
     this.dashboard.setStats({
       accuracy: rollingAcc,
+      spawnRadius: this.spawnRadius,
       baskets: this.episodeStats.baskets,
       episodes: this.episodeStats.count,
       illegalEntries: this.episodeStats.illegal
@@ -1717,6 +1803,8 @@ class TrainingArena {
     } catch (e) {
       console.error("Train Error", e);
     }
+
+    this._advanceCurriculum(rollingAcc);
 
     // Anneal exploration once per trained batch so the policy tightens toward
     // exploitation as it improves, with a floor that keeps a little jitter.
