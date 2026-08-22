@@ -45,6 +45,23 @@ const CONFIG = {
   exploreNoise: 0.4,
   exploreNoiseMin: 0.15,
   exploreNoiseDecay: 0.999,
+  // Balls at the front of each batch launched with the exploration noise
+  // switched off, so the dashboard can report what the policy actually does
+  // rather than what the policy plus a deliberate mis-aim does.
+  //
+  // Every other accuracy number in this app is measured on the behaviour
+  // policy: predictBatch adds up to +/-exploreNoise/2 to each action and the
+  // shot that gets graded is the perturbed one. That conflates two things
+  // that move independently — how good the policy is, and how much noise is
+  // being injected into it — and the second one is on a schedule. An agent
+  // improving while the noise floor holds it back looks exactly like an agent
+  // that has stopped learning.
+  //
+  // These balls are still stored and trained on: a greedy action with a good
+  // reward is the best imitation target in the batch, not a sample to discard.
+  // 128 of 1024 costs an eighth of the batch's exploration and gives the eval
+  // rate a large enough sample to be readable batch to batch.
+  evalBalls: 128,
   advantageTemp: 1.0,
   advantageClip: 20.0,
   // Passes the critic makes over the batch it just collected. The critic is
@@ -80,6 +97,40 @@ const CONFIG = {
     // Shots drawn back out of it into each actor update.
     samplesPerBatch: 128
   },
+  // The launch envelope: what the actor's tanh-bounded 3-vector means in
+  // ft/s. action[0] and action[1] map linearly onto [fwdMin, fwdMax] and
+  // [upMin, upMax], action[2] onto +/-side.
+  //
+  // These were inline constants working out to fwd 0-50, up 10-45 and side
+  // +/-10 ft/s, and all three were far wider than the physics needs. That
+  // costs accuracy directly, because the exploration noise is a fixed fraction
+  // of the action range: at the exploration floor every shot carries
+  // +/-0.075 of action, which against the old fwd range was +/-1.9ft/s of
+  // launch speed — roughly a 10% speed error on a mid-range shot, when a make
+  // wants single-digit percent.
+  //
+  // The side channel was the worst of the three. launch() already aims the
+  // shot down dirToHoop, so action[2] is only ever a correction, yet it spanned
+  // +/-10ft/s — over a ~1.4s flight the noise alone threw the ball more than a
+  // foot sideways, against a rim that leaves ~0.35ft of room around the ball.
+  //
+  // Narrowing the ranges onto the band the physics actually uses multiplies
+  // the effective resolution of the action against the same noise. Modelled
+  // over the spawn distribution (the best action available to any policy, with
+  // the noise added to it), the ceiling on accuracy goes 27% -> 56% at the
+  // current 0.15 floor and 61% -> 85% at 0.05. Reach is unchanged: every spawn
+  // that had a swish available under the old envelope still has one, checked
+  // per distance band down to 2ft.
+  //
+  // Scalars rather than pairs so every bound is reachable from a
+  // tools/hpsearch `--set launch.fwdMax=34` overlay.
+  launch: {
+    fwdMin: 3,
+    fwdMax: 30,
+    upMin: 13,
+    upMax: 39,
+    side: 3
+  },
   ipd: 0.2067,
   visionFov: 60,
   groups: { court: 1, ball: 2 },
@@ -108,7 +159,22 @@ const CONFIG = {
   // upward velocity: a ball rattling on the rim from above can clip the sensor
   // while bouncing back up. Require real ascent, and require the ball to be in
   // the column of the hoop rather than hanging off its edge.
-  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55 }
+  //
+  // scoreRadius is how close to the rim's axis the ball's centre has to be, at
+  // the moment it crosses the rim's plane going down, for the shot to have gone
+  // through the hoop. It is the hole minus the ball: the rim is a torus of
+  // radius 0.75 and tube 0.05, so the clear opening is 0.70, and a ball of
+  // radius 0.40 only fits while its centre is within 0.30 of the axis.
+  //
+  // Nothing enforced this before. Scoring was a contact against the scoring
+  // sensor, and that sensor is a Cylinder(0.5) against a Sphere(0.4), so cannon
+  // reported a hit as soon as the ball's centre came within ~0.9ft of the axis
+  // — more than a foot of slack around a hole the ball barely fits through.
+  // Measured over twelve batches, 75% of the shots credited as baskets had
+  // their centre further than 0.30ft from the axis when they were credited, and
+  // the median was 0.63ft: balls bouncing off the outside of the rim, each one
+  // collecting +25 and the largest positive advantage in the batch.
+  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55, scoreRadius: 0.3 }
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -467,7 +533,14 @@ class CNNAgent {
   }
 
   // pixelDataBatch: Float32Array of size count * frameSize (frameSize = W*H*2).
-  predictBatch(pixelDataBatch, noiseScale = 0) {
+  //
+  // The first greedyCount actions are returned unperturbed. Those balls are the
+  // batch's eval sample (CONFIG.evalBalls): they measure the policy itself,
+  // while the rest carry the exploration noise that generates the batch's
+  // variety. Taking them off the front rather than at random keeps the split
+  // stable across batches, so the eval rate is a fixed sample of the state
+  // distribution rather than a fresh one every time.
+  predictBatch(pixelDataBatch, noiseScale = 0, greedyCount = 0) {
     return tf.tidy(() => {
       // Derive the batch count from the data length instead of assuming a fixed
       // batch size, so a partial or resized batch reshapes correctly.
@@ -485,10 +558,15 @@ class CNNAgent {
       const clamp = (v) => Math.max(-1, Math.min(1, v));
       const actions = [];
       for (let i = 0; i < count; i++) {
+        // Note the noise draw happens either way: multiplying by a zero scale
+        // rather than skipping the call keeps the RNG stream identical whatever
+        // greedyCount is, so a seeded run (tools/hpsearch) stays comparable to
+        // one with a different eval split.
+        const scale = i < greedyCount ? 0 : noiseScale;
         actions.push([
-          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * noiseScale),
-          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * noiseScale),
-          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * noiseScale)
+          clamp(data[i * 3 + 0] + (Math.random() - 0.5) * scale),
+          clamp(data[i * 3 + 1] + (Math.random() - 0.5) * scale),
+          clamp(data[i * 3 + 2] + (Math.random() - 0.5) * scale)
         ]);
       }
       return actions;
@@ -904,7 +982,9 @@ class Court {
     // used to be, because at 0.1ft the balls went straight through it.
     //
     // cannon steps at a fixed 1/60s and actions are clamped to [-1, 1], so a
-    // ball leaves the launcher at up to 51ft/s — 0.85ft of travel per step. A
+    // ball leaves the launcher at up to the corner of CONFIG.launch's envelope
+    // — 49ft/s, or 0.82ft of travel per step. (This was 51ft/s before the
+    // envelope was narrowed, so the margin below only got wider.) A
     // sphere is only stopped if some step samples it before its center passes
     // the box's midplane; past that, the narrowphase finds the *back* face
     // closest and resolves the overlap out the back. That budget is
@@ -1067,26 +1147,78 @@ class BallField {
   }
 }
 
-// What a touch of the scoring sensor means, decided by the direction of travel:
-// "down" through the rim is a basket, "up" through it is an illegal entry from
-// below, and "none" is a graze that is neither — a ball hanging off the rim's
-// edge or bouncing back up off it after coming down from above.
+// Whether a touch of the scoring sensor is the ball coming up through the rim
+// from underneath. It takes more than an upward velocity: a ball rattling on
+// the rim from above can clip the sensor while bouncing back up, so require
+// real ascent and require the ball to be in the column of the hoop rather than
+// hanging off its edge.
+//
+// The other direction is no longer decided here. A sensor touch is a poor proxy
+// for a basket — see CONFIG.hoopEntry.scoreRadius — so baskets are detected
+// geometrically in trackHoopPass instead, and the sensor now only answers this
+// one question.
 //
 // Shared by the batch balls and the manual ball so both agree on what counts.
-function classifyHoopCrossing(body, court) {
+function isEntryFromBelow(body, court) {
   const vy = body.velocity.y;
-  if (vy < 0) return "down";
-  if (vy <= CONFIG.hoopEntry.minAscentSpeed) return "none";
+  if (vy <= CONFIG.hoopEntry.minAscentSpeed) return false;
   const dx = body.position.x - court.rimPositionCannon.x;
   const dz = body.position.z - court.rimPositionCannon.z;
   const r = CONFIG.hoopEntry.columnRadius;
-  return dx * dx + dz * dz <= r * r ? "up" : "none";
+  return dx * dx + dz * dz <= r * r;
+}
+
+// Did the ball just fall through the hoop? Called once per frame per live ball,
+// for anything carrying the {body, scored, enteredFromBelow, prev*} shape —
+// the batch balls and the manual ball both do.
+//
+// This replaces "the ball touched the scoring sensor going down". That test was
+// wrong in both directions of precision: the sensor is a whole foot wider than
+// the rim's opening, and cannon reports the contact once, at whatever point on
+// the way in the shapes first overlapped, which for a flat shot is not where
+// the ball crossed the rim.
+//
+// So find the crossing itself. The rim is a horizontal plane at rim.y; if the
+// ball was above it last frame and is below it now, solve for where it cut the
+// plane and ask whether that point is inside the hole. Interpolating rather
+// than sampling makes the answer independent of how far the ball travels in a
+// step, which at up to 0.8ft per step is otherwise most of the rim's diameter.
+//
+// A ball that has already come up through the hoop cannot score on the way back
+// down, matching the real rule: entering from below kills the ball. Without it
+// a shot fired straight up through the net collects the basket reward on its
+// own descent.
+function trackHoopPass(o, court) {
+  const p = o.body.position;
+  const px = o.prevX;
+  const py = o.prevY;
+  const pz = o.prevZ;
+  o.prevX = p.x;
+  o.prevY = p.y;
+  o.prevZ = p.z;
+
+  if (py === null || o.scored || o.enteredFromBelow) return;
+  const rim = court.rimPositionCannon;
+  // Descending crossing of the rim's plane, and only that: a ball still on its
+  // way up, or one that never reaches the rim's height, is not a candidate.
+  if (!(py >= rim.y && p.y < rim.y)) return;
+
+  const t = (py - rim.y) / (py - p.y);
+  const dx = px + (p.x - px) * t - rim.x;
+  const dz = pz + (p.z - pz) * t - rim.z;
+  const s = CONFIG.hoopEntry.scoreRadius;
+  if (dx * dx + dz * dz <= s * s) o.scored = true;
 }
 
 class Ball {
   constructor(id, field, physics, radius) {
     this.id = id;
     this.field = field;
+    // Balls at the front of the batch are the eval sample: launched greedily
+    // and graded separately (see CONFIG.evalBalls). Fixed by index rather than
+    // re-drawn each batch, and set here rather than in _resetState because it
+    // is a property of the slot, not of the shot.
+    this.isEval = id < CONFIG.evalBalls;
     // Instance transform, mirrored here because the instance matrix is
     // write-only as far as the rest of the app is concerned.
     this.position = new THREE.Vector3();
@@ -1115,6 +1247,12 @@ class Ball {
     this.enteredFromBelow = false;
     this.hitBackboard = false;
     this.hitRim = false;
+    // Last frame's position, for the rim-plane crossing test in trackHoopPass.
+    // Null rather than the spawn point so the first frame of a shot cannot be
+    // read as a crossing from wherever the previous shot ended.
+    this.prevX = null;
+    this.prevY = null;
+    this.prevZ = null;
   }
 
   // Position at a random launch spot and mark active/visible.
@@ -1159,14 +1297,22 @@ class Ball {
     dirToHoop.normalize();
     const dirSide = new THREE.Vector3().crossVectors(UP, dirToHoop).normalize();
 
-    const magFwd = (action[0] + 1) * 50;
-    const magUp = (action[1] + 1) * 35 + 20;
-    const magSide = action[2] * 20;
+    // The action is a launch *velocity* in CONFIG.launch's envelope, converted
+    // to an impulse here. Writing the envelope in ft/s rather than in impulse
+    // units keeps it in the same units as the rest of the world (the court is
+    // in feet, gravity is 32.2ft/s^2), so the numbers can be checked against
+    // the physics instead of against the ball's mass.
+    const L = CONFIG.launch;
+    const lerp = (lo, hi, a) => lo + ((a + 1) / 2) * (hi - lo);
+    const vFwd = lerp(L.fwdMin, L.fwdMax, action[0]);
+    const vUp = lerp(L.upMin, L.upMax, action[1]);
+    const vSide = action[2] * L.side;
 
+    const m = this.body.mass;
     const impulse = new THREE.Vector3()
-      .add(dirToHoop.multiplyScalar(magFwd))
-      .add(new THREE.Vector3(0, 1, 0).multiplyScalar(magUp))
-      .add(dirSide.multiplyScalar(magSide));
+      .add(dirToHoop.multiplyScalar(vFwd * m))
+      .add(new THREE.Vector3(0, 1, 0).multiplyScalar(vUp * m))
+      .add(dirSide.multiplyScalar(vSide * m));
 
     this.body.wakeUp();
     this.body.applyImpulse(
@@ -1177,14 +1323,9 @@ class Ball {
 
   onContact(other, court) {
     if (other === court.scoringSensor) {
-      const crossing = classifyHoopCrossing(this.body, court);
-      // A ball that has already come up through the hoop cannot score on the
-      // way back down, matching the real rule: entering from below kills the
-      // ball. Without this a shot fired straight up through the net collects
-      // the basket reward on its own descent.
-      if (crossing === "up") this.enteredFromBelow = true;
-      else if (crossing === "down" && !this.enteredFromBelow)
-        this.scored = true;
+      // Baskets are decided in trackHoopPass; the sensor's only remaining job
+      // is catching the ball on its way up through the rim.
+      if (isEntryFromBelow(this.body, court)) this.enteredFromBelow = true;
     } else if (other === court.backboardBody) this.hitBackboard = true;
     else if (other === court.rimBody) this.hitRim = true;
   }
@@ -1469,6 +1610,7 @@ class Dashboard {
     this.uiBaskets = document.getElementById("baskets");
     this.uiIllegal = document.getElementById("illegal-entries");
     this.uiAcc = document.getElementById("accuracy");
+    this.uiEvalAcc = document.getElementById("eval-accuracy");
     this.uiStatus = document.getElementById("status");
     this.uiBatch = document.getElementById("batch-progress");
 
@@ -1489,8 +1631,13 @@ class Dashboard {
     if (this.uiBatch) this.uiBatch.innerText = text;
   }
 
-  setStats({ accuracy, baskets, episodes, illegalEntries }) {
+  setStats({ accuracy, evalAccuracy, baskets, episodes, illegalEntries }) {
     this.uiAcc.innerText = Math.round(accuracy * 100) + "%";
+    // Null until the first eval ball has been graded, and when a config turns
+    // the eval split off entirely.
+    if (this.uiEvalAcc)
+      this.uiEvalAcc.innerText =
+        evalAccuracy == null ? "--" : Math.round(evalAccuracy * 100) + "%";
     this.uiBaskets.innerText = baskets;
     this.uiEp.innerText = episodes;
     if (this.uiIllegal) this.uiIllegal.innerText = illegalEntries;
@@ -1735,8 +1882,16 @@ class TrainingArena {
     // which is 150MB of pointless copying per batch at batchSize 1024.
     this.batchPixels = null;
 
+    // Balls launched greedily each batch. Clamped to the batch so a config
+    // with evalBalls >= batchSize degrades to "the whole batch is eval" rather
+    // than silently leaving no ball exploring.
+    this.evalBalls = Math.min(CONFIG.evalBalls, CONFIG.batchSize);
+
     this.episodeStats = { count: 0, baskets: 0, shots: 0, illegal: 0 };
     this.accuracyHistory = [];
+    // Graded separately from accuracyHistory: same window, but only the shots
+    // the exploration noise never touched.
+    this.evalHistory = [];
     this.isTrainingStep = false;
     this.exploreNoise = CONFIG.exploreNoise;
   }
@@ -1770,7 +1925,11 @@ class TrainingArena {
       trajectoryGroup: this.trajectory.group
     });
     this.batchPixels = batch;
-    const actions = this.agent.predictBatch(batch, this.exploreNoise);
+    const actions = this.agent.predictBatch(
+      batch,
+      this.exploreNoise,
+      this.evalBalls
+    );
     for (let i = 0; i < this.balls.length; i++)
       this.balls[i].launch(actions[i], this.hoopPos);
     this.field.flush();
@@ -1792,6 +1951,9 @@ class TrainingArena {
         continue;
       }
       b.syncMesh();
+      // Before the retire check below, so a made shot ends on the frame it
+      // drops through rather than one frame later.
+      trackHoopPass(b, this.court);
       b.path.push(b.position.clone());
 
       const dist = b.body.position.distanceTo(this.hoopPosCannon);
@@ -1870,18 +2032,28 @@ class TrainingArena {
       this.accuracyHistory.push(b.scored ? 1 : 0);
       if (this.accuracyHistory.length > CONFIG.accuracyWindow)
         this.accuracyHistory.shift();
+      if (b.isEval) {
+        this.evalHistory.push(b.scored ? 1 : 0);
+        // Scaled so the eval window spans the same number of batches as the
+        // behaviour window, not the same number of shots — otherwise the eval
+        // rate would average over eight times as much history and lag.
+        const evalWindow = Math.max(
+          1,
+          Math.round(
+            (CONFIG.accuracyWindow * this.evalBalls) / CONFIG.batchSize
+          )
+        );
+        if (this.evalHistory.length > evalWindow) this.evalHistory.shift();
+      }
     }
     // The states are already contiguous and in ball order in batchPixels, so
     // the agent takes the whole array by reference instead of rebuilding it.
     this.agent.store(this.batchPixels, actions, rewards);
 
-    const rollingAcc =
-      this.accuracyHistory.length > 0
-        ? this.accuracyHistory.reduce((a, b) => a + b, 0) /
-          this.accuracyHistory.length
-        : 0;
+    const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
     this.dashboard.setStats({
-      accuracy: rollingAcc,
+      accuracy: mean(this.accuracyHistory),
+      evalAccuracy: this.evalHistory.length ? mean(this.evalHistory) : null,
       baskets: this.episodeStats.baskets,
       episodes: this.episodeStats.count,
       illegalEntries: this.episodeStats.illegal
@@ -1966,6 +2138,9 @@ class ManualBall {
     this.inProgress = false;
     this.scored = false;
     this.enteredFromBelow = false;
+    this.prevX = null;
+    this.prevY = null;
+    this.prevZ = null;
     const x = Math.random() * 42;
     const z = (Math.random() - 0.5) * 46;
     const y = 4.5 + Math.random() * 1.5;
@@ -1979,15 +2154,16 @@ class ManualBall {
 
   onContact(other, court) {
     if (other !== court.scoringSensor) return;
-    const crossing = classifyHoopCrossing(this.body, court);
-    if (crossing === "up") this.enteredFromBelow = true;
-    else if (crossing === "down" && !this.enteredFromBelow) this.scored = true;
+    if (isEntryFromBelow(this.body, court)) this.enteredFromBelow = true;
   }
 
-  update() {
+  update(court) {
     this.mesh.position.copy(this.body.position);
     this.mesh.quaternion.copy(this.body.quaternion);
     if (this.inProgress) {
+      // Only while a shot is live. Right-dragging the ball can carry it down
+      // through the rim's plane, which is a reposition, not a basket.
+      trackHoopPass(this, court);
       const isStopped = this.body.velocity.length() < 0.5;
       const isBelow = this.body.position.y < 1;
       const isOOB =
@@ -2253,7 +2429,7 @@ class App {
       }
     }
 
-    this.manual.update();
+    this.manual.update(this.court);
     this.sceneMgr.render();
   }
 }
