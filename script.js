@@ -98,17 +98,19 @@ const CONFIG = {
     logStdMin: Math.log(0.02),
     logStdMax: Math.log(0.8)
   },
-  // Balls at the front of each batch launched with the exploration noise
-  // switched off, so the dashboard can report what the policy actually does
-  // rather than what the policy plus a deliberate mis-aim does.
+  // Balls at the front of each batch launched on the policy's mean action
+  // rather than a draw from its distribution, so the dashboard can report what
+  // the policy actually does rather than what the policy plus its exploration
+  // does.
   //
   // Every other accuracy number in this app is measured on the behaviour
-  // policy: predictBatch adds up to +/-exploreNoise/2 to each action and the
-  // shot that gets graded is the perturbed one. That conflates two things
-  // that move independently — how good the policy is, and how much noise is
-  // being injected into it — and the second one is on a schedule. An agent
-  // improving while the noise floor holds it back looks exactly like an agent
-  // that has stopped learning.
+  // policy: predictBatch samples each action from N(mean, sigma) and the shot
+  // that gets graded is the sampled one. That conflates two things that move
+  // independently — how good the policy is, and how widely it is currently
+  // exploring. An agent improving while its spread holds it back looks exactly
+  // like an agent that has stopped learning, which is the whole reason the
+  // spread is now something the policy chooses rather than something a
+  // schedule imposes.
   //
   // These balls are still stored and trained on: a greedy action with a good
   // reward is the best imitation target in the batch, not a sample to discard.
