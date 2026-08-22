@@ -184,7 +184,21 @@ const CONFIG = {
     fwdMax: 30,
     upMin: 13,
     upMax: 39,
-    side: 3
+    side: 3,
+    // Peak spin the shooter can put on the ball, in rad/s, about the axis
+    // across the shot. +1 on the channel is backspin, -1 is topspin, and the
+    // sign is chosen so the natural basketball shot is the positive one.
+    //
+    // 20rad/s is a bit over three revolutions a second, which is about what a
+    // real jump shot carries, and it puts 8ft/s of surface speed at the
+    // contact point against a rim the ball arrives at around 20ft/s.
+    //
+    // Worth knowing what this can and cannot do here: cannon has no
+    // aerodynamics, so spin does not bend the flight — there is no Magnus
+    // force — and a shot that touches nothing on the way in is unaffected by
+    // it. It acts only through friction where the ball meets the rim, the
+    // backboard or the floor.
+    spin: 20
   },
   ipd: 0.2067,
   visionFov: 60,
@@ -225,6 +239,57 @@ const CONFIG = {
     // Shots that must be in the accuracy window before it is trusted to gate
     // anything, so the radius cannot run away on one lucky early batch.
     minSamples: 512
+  },
+  // A simple air model: quadratic drag, and Magnus lift so that spin bends the
+  // flight instead of only mattering when the ball touches something.
+  //
+  // Both are written as *accelerations*, and the force applied per step is
+  // whatever produces them. That is deliberate. This world's ball has mass 2,
+  // and with gravity at 32.2ft/s^2 the consistent unit is slugs — so it weighs
+  // about 64lb, roughly 47 times a real basketball. Deriving forces from air
+  // density and frontal area against that mass would give accelerations 47
+  // times too small. Stating the accelerations directly sidesteps the ball's
+  // mass entirely, and lets both constants be calibrated from a real
+  // basketball's behaviour:
+  //
+  //  - drag is a = -k|v|v with k = 0.0066/ft, which puts terminal velocity at
+  //    sqrt(g/k) = 70ft/s. A real basketball's is about 66ft/s.
+  //  - magnus is a = C(w x v) with C dimensionless, calibrated so a shot
+  //    carrying the full 20rad/s of backspin at 25ft/s gets about 2.2ft/s^2 of
+  //    lift — near 7% of gravity, which over a second and a half of flight is
+  //    a couple of feet of extra carry. That is the size of effect backspin
+  //    actually has, and it is what makes the spin channel worth having.
+  //
+  // This replaces the ball's linearDamping, which was a velocity-proportional
+  // stand-in for the same thing; leaving both on would count drag twice.
+  //
+  // One air for every shot, by default: wind and jitter are 0, so a given
+  // action from a given spot always flies the same way.
+  //
+  // The alternative — rolling fresh air per shot, which these knobs turn on —
+  // is more like a real gym, but it costs more than it looks. The agent sees
+  // the court through two cameras; it cannot see the wind. Air drawn per shot
+  // is therefore unobservable from the state, so it is not something the
+  // policy can learn to compensate for, only something it must average over.
+  // It lands entirely in the reward as noise the critic cannot explain, which
+  // inflates the critic's loss and dilutes exactly the advantage signal the
+  // actor is weighted by. A batch of 1024 balls already supplies plenty of
+  // variety through spawn positions and the policy's own sampling, so the
+  // randomness has somewhere better to come from.
+  //
+  // Left parameterised rather than deleted because "is a stochastic
+  // environment worth it here" is a real question and tools/hpsearch can now
+  // answer it: wind is a peak horizontal breeze in ft/s, entering as relative
+  // airspeed so it feeds drag and Magnus the way moving air would rather than
+  // as a bolted-on sideways nudge; jitter.drag stands in for inflation and
+  // surface wear; jitter.magnus for where the seams happen to sit relative to
+  // the spin axis, which genuinely swings how much lift a given spin makes.
+  air: {
+    enabled: true,
+    drag: 0.0066,
+    magnus: 0.0044,
+    wind: 0,
+    jitter: { drag: 0, magnus: 0 }
   },
   // Which way the ball went through the hoop is the whole game, so the two
   // directions sit at opposite ends of the reward scale rather than a hair
@@ -269,6 +334,13 @@ const CONFIG = {
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
+
+// The launch action, channel by channel. Ball.launch maps each onto its range
+// in CONFIG.launch; the actor emits a mean and a log standard deviation for
+// every one of them, so widening the action is a matter of adding a channel
+// here, a range there, and the physics to apply it.
+const ACTION = { fwd: 0, up: 1, side: 2, spin: 3 };
+const ACTION_DIM = 4;
 
 class Assets {
   constructor() {
@@ -620,7 +692,7 @@ class ReplayBuffer {
     this.capacity = capacity;
     this.frameSize = frameSize;
     this.states = new Float32Array(capacity * frameSize);
-    this.actions = new Float32Array(capacity * 3);
+    this.actions = new Float32Array(capacity * ACTION_DIM);
     this.rewards = new Float32Array(capacity);
     this.priority = new Float32Array(capacity);
     this.size = 0;
@@ -645,9 +717,8 @@ class ReplayBuffer {
     }
     const f = this.frameSize;
     this.states.set(states.subarray(i * f, (i + 1) * f), slot * f);
-    this.actions[slot * 3 + 0] = actions[i][0];
-    this.actions[slot * 3 + 1] = actions[i][1];
-    this.actions[slot * 3 + 2] = actions[i][2];
+    for (let k = 0; k < ACTION_DIM; k++)
+      this.actions[slot * ACTION_DIM + k] = actions[i][k];
     this.rewards[slot] = reward;
     this.priority[slot] = priority;
     return true;
@@ -670,14 +741,13 @@ class ReplayBuffer {
     }
     const f = this.frameSize;
     const states = new Float32Array(n * f);
-    const actions = new Float32Array(n * 3);
+    const actions = new Float32Array(n * ACTION_DIM);
     const rewards = new Float32Array(n);
     for (let k = 0; k < n; k++) {
       const src = idx[k];
       states.set(this.states.subarray(src * f, (src + 1) * f), k * f);
-      actions[k * 3 + 0] = this.actions[src * 3 + 0];
-      actions[k * 3 + 1] = this.actions[src * 3 + 1];
-      actions[k * 3 + 2] = this.actions[src * 3 + 2];
+      for (let d = 0; d < ACTION_DIM; d++)
+        actions[k * ACTION_DIM + d] = this.actions[src * ACTION_DIM + d];
       rewards[k] = this.rewards[src];
     }
     return { states, actions, rewards, count: n };
@@ -756,12 +826,12 @@ class CNNAgent {
     // stable feature extractor.
     m.layers[0].trainable = false;
     m.layers[1].trainable = false;
-    // Six linear outputs, not three tanh ones: the first three are the mean of
-    // the action distribution (squashed by tanh in _headSplit, not here, so the
-    // second three stay unsquashed) and the last three are its log standard
-    // deviation. Keeping it a single sequential dense layer rather than two
-    // heads keeps the actor serializable through EXPORT POLICY.
-    m.add(tf.layers.dense({ units: 6 }));
+    // 2 * ACTION_DIM linear outputs, not ACTION_DIM tanh ones: the first half
+    // is the mean of the action distribution (squashed by tanh in _headSplit,
+    // not here, so the second half stays unsquashed) and the second half is its
+    // log standard deviation. Keeping it a single sequential dense layer rather
+    // than two heads keeps the actor serializable through EXPORT POLICY.
+    m.add(tf.layers.dense({ units: 2 * ACTION_DIM }));
     m.compile({
       optimizer: tf.train.adam(this.learningRate),
       loss: "meanSquaredError"
@@ -776,7 +846,8 @@ class CNNAgent {
       const head = m.layers[m.layers.length - 1];
       const [kernel, bias] = head.getWeights();
       const b = bias.arraySync().slice();
-      for (let i = 3; i < 6; i++) b[i] = CONFIG.policy.logStdInit;
+      for (let i = ACTION_DIM; i < 2 * ACTION_DIM; i++)
+        b[i] = CONFIG.policy.logStdInit;
       head.setWeights([kernel, tf.tensor1d(b)]);
     });
 
@@ -791,9 +862,9 @@ class CNNAgent {
   // outside the range instead of merely small — which is what stops a policy
   // that is learning nothing from drifting the spread out forever.
   _headSplit(raw) {
-    const mean = tf.tanh(raw.slice([0, 0], [-1, 3]));
+    const mean = tf.tanh(raw.slice([0, 0], [-1, ACTION_DIM]));
     const logStd = raw
-      .slice([0, 3], [-1, 3])
+      .slice([0, ACTION_DIM], [-1, ACTION_DIM])
       .clipByValue(CONFIG.policy.logStdMin, CONFIG.policy.logStdMax);
     return { mean, logStd, std: tf.exp(logStd) };
   }
@@ -859,8 +930,8 @@ class CNNAgent {
       const actions = [];
       for (let i = 0; i < count; i++) {
         const a = [];
-        for (let k = 0; k < 3; k++) {
-          const j = i * 3 + k;
+        for (let k = 0; k < ACTION_DIM; k++) {
+          const j = i * ACTION_DIM + k;
           // The draw happens either way: scaling it to zero rather than
           // skipping the call keeps the RNG stream identical whatever
           // greedyCount is, so a seeded run (tools/hpsearch) stays comparable
@@ -914,7 +985,7 @@ class CNNAgent {
       this.visionW,
       this.channels
     ]);
-    const actionTensor = tf.tensor2d(actions, [batchSize, 3]);
+    const actionTensor = tf.tensor2d(actions, [batchSize, ACTION_DIM]);
     const rewardTensor = tf.tensor2d(rewards, [batchSize, 1]);
 
     const criticHistory = await this.critic.fit(stateTensor, rewardTensor, {
@@ -1016,7 +1087,7 @@ class CNNAgent {
       this.visionW,
       this.channels
     ]);
-    const actions = tf.tensor2d(draw.actions, [draw.count, 3]);
+    const actions = tf.tensor2d(draw.actions, [draw.count, ACTION_DIM]);
     const values = this.critic.predict(states);
     const valueData = values.dataSync();
 
@@ -1175,6 +1246,67 @@ class SceneManager {
   }
 }
 
+// Drag and Magnus for one step, accumulated straight into each body's force
+// vector. See CONFIG.air for where the constants come from.
+//
+// Written against body.force directly rather than through applyForce(), which
+// would allocate two Vec3s per body per step — 120k allocations a second at
+// batchSize 1024, for arithmetic that is a dozen multiplies.
+function applyAir(bodies) {
+  const A = CONFIG.air;
+  if (!A.enabled) return;
+  for (const b of bodies) {
+    // Retired balls are asleep and the integrator skips them anyway.
+    if (b.sleepState === CANNON.Body.SLEEPING) continue;
+    // Null on the singular-air default, and undefined before the first launch;
+    // both mean "the gym's own air".
+    const air = b.air || A;
+    const v = b.velocity;
+    // Relative airspeed. Wind belongs here rather than as a separate push:
+    // what drags on the ball is its motion *through the air*, so a breeze
+    // makes a shot into it slow faster and one with it carry, which is the
+    // effect worth having.
+    const rx = v.x - (air.windX || 0);
+    const ry = v.y;
+    const rz = v.z - (air.windZ || 0);
+    const speed = Math.sqrt(rx * rx + ry * ry + rz * rz);
+    if (speed < 1e-4) continue;
+    const w = b.angularVelocity;
+    const m = b.mass;
+    // a = -k|vr|vr + C(w x vr), then F = ma.
+    b.force.x +=
+      m * (-air.drag * speed * rx + air.magnus * (w.y * rz - w.z * ry));
+    b.force.y +=
+      m * (-air.drag * speed * ry + air.magnus * (w.z * rx - w.x * rz));
+    b.force.z +=
+      m * (-air.drag * speed * rz + air.magnus * (w.x * ry - w.y * rx));
+  }
+}
+
+// Roll the air for one shot and hang it on the body. See CONFIG.air.
+function sampleShotAir(body) {
+  const A = CONFIG.air;
+  const j = A.jitter;
+  // The default: one air for the whole gym. Returning before drawing anything
+  // matters — it keeps the singular model free of RNG draws, so turning the
+  // weather off does not shift the seeded spawn stream a run is compared on.
+  if (!A.wind && !j.drag && !j.magnus) {
+    body.air = null;
+    return;
+  }
+  const spread = (f) => 1 + (Math.random() * 2 - 1) * f;
+  const heading = Math.random() * Math.PI * 2;
+  // sqrt keeps the draw uniform over the disc of possible breezes rather than
+  // clustering it at dead calm.
+  const speed = Math.sqrt(Math.random()) * A.wind;
+  body.air = {
+    drag: A.drag * spread(j.drag),
+    magnus: A.magnus * spread(j.magnus),
+    windX: Math.cos(heading) * speed,
+    windZ: Math.sin(heading) * speed
+  };
+}
+
 class PhysicsWorld {
   constructor() {
     this.world = new CANNON.World();
@@ -1191,6 +1323,8 @@ class PhysicsWorld {
     // away instead of staying at batchSize until the last shot lands.
     this.world.allowSleep = true;
 
+    this.aeroBodies = [];
+
     this.concrete = new CANNON.Material("concrete");
     this.plastic = new CANNON.Material("plastic");
     this.world.addContactMaterial(
@@ -1205,7 +1339,16 @@ class PhysicsWorld {
     this.world.addBody(body);
   }
 
+  // Bodies the air acts on: the balls, and nothing else. The court does not
+  // move and the forces would be discarded on a static body regardless.
+  addAero(body) {
+    this.aeroBodies.push(body);
+  }
+
   step() {
+    // Before the step, because cannon clears the force accumulator at the end
+    // of every one.
+    applyAir(this.aeroBodies);
     this.world.step(1 / 60);
   }
 
@@ -1552,19 +1695,23 @@ class Ball {
       mass: 2,
       shape: new CANNON.Sphere(radius),
       material: physics.plastic,
-      linearDamping: 0.1,
+      // No linearDamping: CONFIG.air's quadratic drag models the same thing
+      // physically, and running both would count the air twice. angularDamping
+      // stays as the stand-in for spin bleeding off over a flight.
+      linearDamping: 0,
       angularDamping: 0.1
     });
     this.body.collisionFilterGroup = CONFIG.groups.ball;
     this.body.collisionFilterMask = CONFIG.groups.court;
     physics.add(this.body);
+    physics.addAero(this.body);
 
     this._resetState();
   }
 
   _resetState() {
     this.active = false;
-    this.action = [0, 0, 0];
+    this.action = new Array(ACTION_DIM).fill(0);
     this.path = [];
     this.minDist = 100;
     this.scored = false;
@@ -1668,21 +1815,39 @@ class Ball {
     // the physics instead of against the ball's mass.
     const L = CONFIG.launch;
     const lerp = (lo, hi, a) => lo + ((a + 1) / 2) * (hi - lo);
-    const vFwd = lerp(L.fwdMin, L.fwdMax, action[0]);
-    const vUp = lerp(L.upMin, L.upMax, action[1]);
-    const vSide = action[2] * L.side;
+    const vFwd = lerp(L.fwdMin, L.fwdMax, action[ACTION.fwd]);
+    const vUp = lerp(L.upMin, L.upMax, action[ACTION.up]);
+    const vSide = action[ACTION.side] * L.side;
+    const spin = action[ACTION.spin] * L.spin;
 
     const m = this.body.mass;
     const impulse = new THREE.Vector3()
-      .add(dirToHoop.multiplyScalar(vFwd * m))
+      .add(dirToHoop.clone().multiplyScalar(vFwd * m))
       .add(new THREE.Vector3(0, 1, 0).multiplyScalar(vUp * m))
-      .add(dirSide.multiplyScalar(vSide * m));
+      .add(dirSide.clone().multiplyScalar(vSide * m));
+
+    // This shot's air, drawn fresh (see CONFIG.air). Every ball in the batch
+    // flies through slightly different weather, so two identical actions from
+    // the same spot do not have to produce the same result.
+    sampleShotAir(this.body);
 
     this.body.wakeUp();
     this.body.applyImpulse(
       new CANNON.Vec3(impulse.x, impulse.y, impulse.z),
       new CANNON.Vec3(0, 0, 0)
     );
+
+    // Spin is set rather than applied: a torque impulse would have to be
+    // divided through the sphere's inertia to get here anyway, and the shot
+    // starts from rest, so the angular velocity IS the action.
+    //
+    // The axis is -dirSide. dirSide is UP x dirToHoop, so for a shot heading
+    // down +x it is -z; backspin — the top of the ball travelling back toward
+    // the shooter — is +z about that same shot, which is -dirSide. Setting it
+    // after wakeUp() matters: Body.sleep() zeroes both velocities, so anything
+    // written before the wake is discarded.
+    const w = dirSide.clone().multiplyScalar(-spin);
+    this.body.angularVelocity.set(w.x, w.y, w.z);
   }
 
   onContact(other, court) {
@@ -2177,16 +2342,19 @@ class Dashboard {
         y: startY + row * (nodeSize + gap)
       });
     }
-    const outPositions = [
-      { x: outX, y: outYStart },
-      { x: outX, y: outYStart + outGap },
-      { x: outX, y: outYStart + outGap * 2 }
-    ];
+    // One node per action channel, centred on the panel however many there
+    // are, so adding a channel does not push the column off the canvas.
+    const outPositions = [];
+    for (let i = 0; i < ACTION_DIM; i++)
+      outPositions.push({
+        x: outX,
+        y: outYStart + outGap * (i - (ACTION_DIM - 1) / 2) + outGap
+      });
 
     ctx.lineWidth = 0.5;
     for (let i = 0; i < 64; i++) {
       if (dense[i] > 0.1) {
-        for (let j = 0; j < 3; j++) {
+        for (let j = 0; j < ACTION_DIM; j++) {
           const alpha = Math.min(1, dense[i] * 0.5);
           ctx.strokeStyle = `rgba(100, 200, 255, ${alpha})`;
           ctx.beginPath();
@@ -2209,8 +2377,9 @@ class Dashboard {
       );
       ctx.fill();
     }
-    const labels = ["V", "F", "A"];
-    for (let i = 0; i < 3; i++) {
+    // Vertical power, forward power, aim adjustment, spin.
+    const labels = ["V", "F", "A", "S"];
+    for (let i = 0; i < ACTION_DIM; i++) {
       const val = (output[i] + 1) / 2;
       const intensity = Math.min(255, Math.floor(val * 255));
       ctx.fillStyle = `rgb(${intensity}, 50, ${255 - intensity})`;
@@ -2527,12 +2696,16 @@ class ManualBall {
       mass: 2,
       shape: new CANNON.Sphere(radius),
       material: physics.plastic,
-      linearDamping: 0.1,
+      // No linearDamping: CONFIG.air's quadratic drag models the same thing
+      // physically, and running both would count the air twice. angularDamping
+      // stays as the stand-in for spin bleeding off over a flight.
+      linearDamping: 0,
       angularDamping: 0.1
     });
     this.body.collisionFilterGroup = CONFIG.groups.ball;
     this.body.collisionFilterMask = CONFIG.groups.court;
     physics.add(this.body);
+    physics.addAero(this.body);
 
     this.enabled = true; // disabled while training
     this.inProgress = false;
@@ -2710,6 +2883,8 @@ class ManualBall {
           .sub(this.dragCurrent);
         const power = 15;
         this.inProgress = true;
+        // The player's shot flies through its own air too, same as the batch's.
+        sampleShotAir(this.body);
         this.body.wakeUp();
         this.body.applyImpulse(
           new CANNON.Vec3(f.x * power, f.y * power, f.z * power),

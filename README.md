@@ -15,10 +15,10 @@ the critic learns the cloud pulls in toward the rim.
 
 Each ball carries a pair of stereo cameras pointed at the rim. Every training
 batch, the agent renders each ball's view, feeds the two grayscale images through
-a small convolutional network, and outputs a 3-vector launch action (vertical
-power, forward power, aim adjustment) — `CONFIG.launch` is the envelope in ft/s
-that vector is stretched onto. The ball is launched, the physics play
-out, and the shot's outcome becomes the reward. The agent learns from vision
+a small convolutional network, and outputs a 4-vector launch action (vertical
+power, forward power, aim adjustment, spin) — `CONFIG.launch` is the envelope
+in ft/s and rad/s that vector is stretched onto. The ball is launched, the
+physics play out, and the shot's outcome becomes the reward. The agent learns from vision
 alone — it is never told where the hoop is.
 
 ### How the learning works
@@ -56,6 +56,17 @@ terminal reward, so there's no temporal credit assignment.
   (`CONFIG.replay`) and replayed into each actor update, so a made basket is
   worth more than the single gradient step it used to get before being
   discarded.
+- **Spin & air** — the fourth action channel is backspin or topspin, applied as
+  the ball's launch angular velocity. It is worth having because the ball flies
+  through air: `CONFIG.air` adds quadratic drag and a Magnus force, both written
+  as accelerations so the ball's (unphysically heavy) mass drops out and the
+  constants can be calibrated from a real basketball — terminal velocity lands
+  at 70ft/s against a real ball's ~66. Sweeping the action space against the
+  physics, having spin to choose is worth about 4 points of achievable accuracy
+  over locking it at zero, and backspin wins at most spawns. The air is the same
+  for every shot by default; `air.wind` and `air.jitter` roll it per shot
+  instead, which is more like a real gym but adds reward noise the agent has no
+  way to see coming.
 - **Curriculum** — balls spawn inside a radius of the rim that starts small and
   grows, one-way, whenever the rolling accuracy clears a threshold
   (`CONFIG.curriculum`). The far court is where shots are both hardest to hit
