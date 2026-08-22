@@ -1183,6 +1183,65 @@ class CNNAgent {
   async saveActor() {
     await this.actor.save("downloads://basketball-agent-actor");
   }
+
+  // Load an actor written by saveActor(). The download produces two files — the
+  // topology JSON and its .weights.bin sidecar — and tf.io.browserFiles wants
+  // the JSON first, so it is picked out by extension here rather than trusting
+  // the order the file picker handed the pair over in.
+  //
+  // The weights are copied into the existing actor instead of swapping the
+  // loaded model in for it: this.actor carries state that a fresh
+  // deserialization does not — the two frozen conv layers, the compile, and the
+  // layer indices getActivations() reads — and setWeights assigns into the
+  // variables actorOptimizer is already bound to, so training resumes on the
+  // imported policy instead of on an optimizer that has never seen it.
+  async loadActor(files) {
+    const list = Array.from(files);
+    const topology = list.find((f) => f.name.endsWith(".json"));
+    const binaries = list.filter((f) => f !== topology);
+    if (!topology || !binaries.length)
+      throw new Error(
+        "Select both files the export produced: the .json and its .weights.bin"
+      );
+
+    const loaded = await tf.loadLayersModel(
+      tf.io.browserFiles([topology, ...binaries])
+    );
+    try {
+      const source = loaded.getWeights();
+      const target = this.actor.getWeights();
+      // Shape-check the whole set before assigning any of it. setWeights throws
+      // on the first mismatch, which on a partially compatible file would leave
+      // the actor holding half of each policy; a file exported under a
+      // different visionWidth/visionHeight or ACTION_DIM is exactly that case.
+      if (source.length !== target.length)
+        throw new Error(
+          `Expected ${target.length} weight tensors, file has ${source.length}`
+        );
+      for (let i = 0; i < target.length; i++) {
+        const want = target[i].shape;
+        const got = source[i].shape;
+        if (want.length !== got.length || want.some((d, k) => d !== got[k]))
+          throw new Error(
+            `Weight ${i} is ${got.join("x")} in the file, ` +
+              `this build expects ${want.join("x")}`
+          );
+      }
+
+      this.actor.setWeights(source);
+      // The critic owns the shared conv backbone and copies it into the actor
+      // after every batch (see train()), so an imported actor whose filters the
+      // critic does not have would be overwritten by the untrained ones on the
+      // very first update — the import would appear to take and then silently
+      // undo itself. Push the filters the other way once, here.
+      tf.tidy(() => {
+        for (let i = 0; i < 2; i++)
+          this.critic.layers[i].setWeights(this.actor.layers[i].getWeights());
+      });
+    } finally {
+      loaded.dispose();
+    }
+  }
 }
 
 class SceneManager {
@@ -3058,6 +3117,8 @@ class App {
   _wireButtons() {
     const btnTrain = document.getElementById("toggle-train");
     const btnExport = document.getElementById("export-btn");
+    const btnImport = document.getElementById("import-btn");
+    const importInput = document.getElementById("import-input");
 
     btnTrain.addEventListener("click", () => {
       this.trainingMode = !this.trainingMode;
@@ -3078,6 +3139,36 @@ class App {
 
     btnExport.addEventListener("click", async () => {
       if (this.agent && this.agent.actor) await this.agent.saveActor();
+    });
+
+    btnImport.addEventListener("click", () => {
+      if (!this.agent) return;
+      // Refuse mid-training rather than importing over a batch already in
+      // flight: those shots were taken by the outgoing policy, and the update
+      // they trigger when the batch lands would fit the freshly imported actor
+      // back toward them.
+      if (this.trainingMode) {
+        this.dashboard.setStatus("Stop training to import", "#ff0");
+        return;
+      }
+      importInput.click();
+    });
+
+    importInput.addEventListener("change", async () => {
+      // Snapshot the selection before clearing the picker: value = "" empties
+      // the live FileList, and the clear has to happen either way so that
+      // re-selecting the same files still fires change — the obvious thing to
+      // do after a failed import.
+      const files = Array.from(importInput.files || []);
+      importInput.value = "";
+      if (!this.agent || !files.length) return;
+      try {
+        await this.agent.loadActor(files);
+        this.dashboard.setStatus("Policy Imported", "#0f0");
+      } catch (e) {
+        console.error("Policy import failed", e);
+        this.dashboard.setStatus("Import Failed", "#ff4444");
+      }
     });
   }
 

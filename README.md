@@ -105,9 +105,22 @@ The app opens in **manual mode** with a single ball you can play with:
 | Reset the ball | Space |
 | Start / stop learning | **START TRAINING** button |
 | Save the trained policy | **EXPORT POLICY** button (downloads the actor) |
+| Load a saved policy | **IMPORT POLICY** button (select both exported files) |
 
-The exported actor has a six-wide head: three action means (apply `tanh`) and
-three log standard deviations. Take the means for a deterministic policy.
+The exported actor has an eight-wide head: four action means (apply `tanh`) and
+four log standard deviations. Take the means for a deterministic policy.
+
+**EXPORT POLICY** downloads the two files TensorFlow.js writes for a model —
+`basketball-agent-actor.json` (topology) and `basketball-agent-actor.weights.bin`
+— and **IMPORT POLICY** takes that pair back, in either order. The weights are
+copied into the running actor, so training continues from the imported policy
+rather than from scratch; the shared conv filters are pushed into the critic at
+the same time, so the first batch after an import does not overwrite them. A
+file exported under a different `visionWidth`/`visionHeight`, or from a build
+with a different action space, is rejected on a shape check and leaves the
+running policy alone. Import is only available while training is stopped: the
+batch in flight was shot by the outgoing policy, and the update it triggers on
+landing would pull the freshly imported actor back toward it.
 
 While training, the manual ball is disabled and the batch takes over the court.
 Stopping training clears the batch off the floor and hands the court back.
