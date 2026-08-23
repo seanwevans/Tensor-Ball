@@ -112,8 +112,11 @@ const CONFIG = {
   // spread is now something the policy chooses rather than something a
   // schedule imposes.
   //
-  // These balls are still stored and trained on: a greedy action with a good
-  // reward is the best imitation target in the batch, not a sample to discard.
+  // These balls still fit the critic and are still admitted to replay, but
+  // they are held out of the actor's own update — under the likelihood
+  // objective an action drawn at the mean cannot move the mean and can only
+  // shrink the spread, which is a bias rather than a datum. See train().
+  //
   // 128 of 1024 costs an eighth of the batch's exploration and gives the eval
   // rate a large enough sample to be readable batch to batch.
   evalBalls: 128,
@@ -141,6 +144,12 @@ const CONFIG = {
   // advantage, not by reward, because reward is dominated by shot distance —
   // a made three is worth more than a made layup regardless of which was the
   // better decision from where the ball was standing.
+  //
+  // An advantage is a reading against a critic, though, and the critic moves.
+  // Entries are therefore re-priced against the current one as they are drawn
+  // (see ReplayBuffer.reprice) — without that the admission bar ratchets up
+  // until nothing can clear it and the buffer freezes on whatever it happened
+  // to be holding.
   //
   // Costs a Float32Array of capacity * visionW * visionH * 2 * 4B, which is
   // 37MB at these defaults — half a batch's state tensor.
@@ -732,10 +741,45 @@ class ReplayBuffer {
     return true;
   }
 
+  // Re-price entries against the critic that is running now.
+  //
+  // priority is an advantage, and an advantage is only meaningful next to the
+  // value estimate it was measured against. Admission compares a fresh
+  // advantage to one recorded batches or thousands of batches ago, so as the
+  // critic calibrates and the same quality of shot scores a smaller advantage,
+  // the bar to get in rises on its own — and it rises fastest against the
+  // entries admitted when the critic was worst, which are exactly the ones
+  // whose numbers were most inflated.
+  //
+  // Left alone that bar climbs to the largest advantage a batch can produce and
+  // sticks there, and the actor spends the rest of the run replaying a set that
+  // barely changes. Measured headlessly on this build: the weakest held entry's
+  // priority goes 0.8 -> 7.0 -> 29.3 -> 31.0 over the first sixty batches and
+  // then stops moving (31.0 -> 31.1 across the next fifteen), while admissions
+  // fall from 64 a batch to between nought and three — against a batch whose
+  // best shot is scoring around 32. Those entries were sampled when sigma was
+  // still 0.2 wide, so what the actor keeps being shown is the scatter of a
+  // policy it has already outgrown.
+  //
+  // So re-price what we draw. _replayPass already predicts a current value for
+  // every sampled entry, which is the same subtraction admission does, so this
+  // costs nothing but the write-back. Sampling is uniform, so at
+  // samplesPerBatch/capacity a batch every entry is re-priced every few
+  // batches, and one that only looked good because the critic was wrong sinks
+  // to where a current batch can evict it.
+  reprice(indices, advantages) {
+    for (let k = 0; k < indices.length; k++) {
+      const slot = indices[k];
+      if (slot >= 0 && slot < this.size) this.priority[slot] = advantages[k];
+    }
+  }
+
   // `count` distinct entries at random, as flat arrays ready for tf.tensor.
   // Uniform rather than priority-weighted: the buffer is already the top of the
   // distribution, and weighting the draw too would train the actor almost
   // entirely on whichever handful of shots scored best.
+  //
+  // The draw's source slots come back with it so the caller can reprice them.
   sample(count) {
     const n = Math.min(count, this.size);
     if (n === 0) return null;
@@ -751,14 +795,16 @@ class ReplayBuffer {
     const states = new Float32Array(n * f);
     const actions = new Float32Array(n * ACTION_DIM);
     const rewards = new Float32Array(n);
+    const slots = new Int32Array(n);
     for (let k = 0; k < n; k++) {
       const src = idx[k];
+      slots[k] = src;
       states.set(this.states.subarray(src * f, (src + 1) * f), k * f);
       for (let d = 0; d < ACTION_DIM; d++)
         actions[k * ACTION_DIM + d] = this.actions[src * ACTION_DIM + d];
       rewards[k] = this.rewards[src];
     }
-    return { states, actions, rewards, count: n };
+    return { states, actions, rewards, slots, count: n };
   }
 }
 
@@ -1002,11 +1048,43 @@ class CNNAgent {
     return m;
   }
 
+  // Bound the spread the sampler sees without deleting the evidence that the
+  // bound is in the wrong place.
+  //
+  // clipByValue's gradient is exactly zero outside its range, so logStdMin was
+  // not a floor, it was an absorbing state: the first update that pushed a
+  // state's log sigma under it removed the only term that could ever push it
+  // back, and that state stopped exploring for the remainder of the run. The
+  // objective's own equilibrium — log(sigma) pulling the spread down, z^2
+  // pushing it up whenever the fitted actions scatter wider — exists only
+  // where the gradient survives, and a one-sided ratchet to the floor is what
+  // is left where it does not. That is the same failure the loss in
+  // _fitActorWeighted has a long comment about; it was fixed there and left
+  // standing here, where it is the sampler's bound rather than the loss's.
+  //
+  // Straight-through resolves it: the value handed downstream is clipped, so
+  // nothing samples or reports a sigma outside CONFIG.policy's range, while
+  // the gradient passes unchanged, so a policy whose good actions scatter
+  // wider than the floor keeps being told so and climbs back off it. Inside
+  // the range this is the identity — a policy that never reaches a bound
+  // cannot tell the difference.
+  _boundLogStd(x) {
+    // Built on first use: tf is a global from a CDN script tag, and a class
+    // field would evaluate before it exists in the harness's load order.
+    if (!CNNAgent._clipST) {
+      CNNAgent._clipST = tf.customGrad((t) => ({
+        value: t.clipByValue(CONFIG.policy.logStdMin, CONFIG.policy.logStdMax),
+        gradFunc: (dy) => [dy]
+      }));
+    }
+    return CNNAgent._clipST(x);
+  }
+
   _headSplit(raw) {
     const mean = tf.tanh(raw.slice([0, 0], [-1, ACTION_DIM]));
-    const logStd = raw
-      .slice([0, ACTION_DIM], [-1, ACTION_DIM])
-      .clipByValue(CONFIG.policy.logStdMin, CONFIG.policy.logStdMax);
+    const logStd = this._boundLogStd(
+      raw.slice([0, ACTION_DIM], [-1, ACTION_DIM])
+    );
     return { mean, logStd, std: tf.exp(logStd) };
   }
 
@@ -1075,8 +1153,18 @@ class CNNAgent {
     });
   }
 
-  store(states, actions, rewards) {
-    this.memory = { states, actions, rewards, count: actions.length };
+  // greedyCount is the batch's eval slice: the balls at the front that were
+  // launched on the policy's mean rather than on a draw from it (see
+  // CONFIG.evalBalls). They are stored like everything else — see train() for
+  // what they do and do not take part in.
+  store(states, actions, rewards, greedyCount = 0) {
+    this.memory = {
+      states,
+      actions,
+      rewards,
+      greedyCount,
+      count: actions.length
+    };
   }
 
   // Weight only positive-advantage transitions; zero out misses and sub-baseline actions
@@ -1109,7 +1197,13 @@ class CNNAgent {
 
   async train() {
     if (!this.memory) return null;
-    const { states, actions, rewards, count: batchSize } = this.memory;
+    const {
+      states,
+      actions,
+      rewards,
+      greedyCount,
+      count: batchSize
+    } = this.memory;
 
     const stateTensor = tf.tensor(states, [
       batchSize,
@@ -1139,13 +1233,39 @@ class CNNAgent {
       advVar += (advantageData[i] - advMean) ** 2;
     const advStd = Math.sqrt(advVar / batchSize) || 1;
 
+    // The eval slice is held out of the actor's update, and it is the
+    // objective rather than the shot that holds it out.
+    //
+    // Those balls were launched on the policy's mean, so the action being
+    // fitted IS the mean it is being fitted to. Under a regression objective
+    // that made them the batch's best imitation target, which is what the note
+    // on CONFIG.evalBalls says. Under the likelihood objective that replaced
+    // it, it makes them degenerate: -log N(a | mu, sigma) at a == mu has
+    // gradient -z/sigma on the mean, which is zero, and +1 per dimension on
+    // log sigma. They cannot move the mean at all, and the only thing they say
+    // about the spread is "smaller" — with no evidence in them about how far
+    // good actions actually scatter, because they were not allowed to scatter.
+    //
+    // The size of it: _fitActorWeighted normalizes by the sum of the weights,
+    // so the fitted variance is the weight-average of (a - mu)^2, and a slice
+    // holding a fraction f of the batch's weight scales it by (1 - f)
+    // regardless of what the policy is doing. The sampler then draws from what
+    // comes out, so "sigma equals (1 - f) times the spread of actions drawn
+    // from sigma" has one fixed point, at zero. The slice was added to measure
+    // the policy; left in the update it walks the policy's exploration to the
+    // floor on a schedule that has nothing to do with what the policy has
+    // learned — and the floor, before _boundLogStd above, was where
+    // exploration ended for good.
+    //
+    // They still fit the critic, and they are still admitted to replay: by the
+    // time a stored shot is drawn again the actor has moved, its action is no
+    // longer the mean, and it carries an ordinary gradient on both.
     const weightData = new Float32Array(batchSize);
     for (let i = 0; i < batchSize; i++)
-      weightData[i] = this._advantageWeight(
-        advantageData[i],
-        advMean,
-        advStd
-      );
+      weightData[i] =
+        i < greedyCount
+          ? 0
+          : this._advantageWeight(advantageData[i], advMean, advStd);
     const weightTensor = tf.tensor1d(weightData);
 
     // Train the actor end-to-end across its conv backbone and dense head
@@ -1180,12 +1300,14 @@ class CNNAgent {
     const valueData = values.dataSync();
 
     const weightData = new Float32Array(draw.count);
-    for (let i = 0; i < draw.count; i++)
-      weightData[i] = this._advantageWeight(
-        draw.rewards[i] - valueData[i],
-        advMean,
-        advStd
-      );
+    const repriced = new Float32Array(draw.count);
+    for (let i = 0; i < draw.count; i++) {
+      repriced[i] = draw.rewards[i] - valueData[i];
+      weightData[i] = this._advantageWeight(repriced[i], advMean, advStd);
+    }
+    // The advantage just computed is the entry's price under the current
+    // critic. See ReplayBuffer.reprice.
+    this.replay.reprice(draw.slots, repriced);
     const weights = tf.tensor1d(weightData);
 
     this._fitActorWeighted(states, actions, weights);
@@ -3138,7 +3260,7 @@ class TrainingArena {
     }
     // The states are already contiguous and in ball order in batchPixels, so
     // the agent takes the whole array by reference instead of rebuilding it.
-    this.agent.store(this.batchPixels, actions, rewards);
+    this.agent.store(this.batchPixels, actions, rewards, this.evalBalls);
 
     // Bound rather than inlined: _advanceCurriculum below gates on this same
     // number, and the two must not be able to drift apart.

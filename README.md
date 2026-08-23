@@ -51,11 +51,17 @@ terminal reward, so there's no temporal credit assignment.
   (`CONFIG.evalBalls`) takes the distribution's mean instead of a draw from it,
   so the dashboard reports the policy's own accuracy next to the behaviour
   policy's — the two move independently, and only the first is what the agent
-  has learned.
+  has learned. Those greedy balls fit the critic and feed the replay buffer but
+  are held out of the actor's own update: an action drawn at the distribution's
+  mean cannot move that mean, and under a likelihood objective the only thing
+  it says about the spread is "narrower", whatever the policy has learned.
 - **Replay** — the highest-advantage shots are kept in a fixed-capacity buffer
   (`CONFIG.replay`) and replayed into each actor update, so a made basket is
   worth more than the single gradient step it used to get before being
-  discarded.
+  discarded. Entries are re-priced against the current critic as they are
+  drawn: an advantage only means something next to the value estimate it was
+  measured against, and a buffer that keeps comparing fresh advantages to stale
+  ones lets the bar to get in ratchet up until almost nothing clears it.
 - **Spin & air** — the fourth action channel is backspin or topspin, applied as
   the ball's launch angular velocity. It is worth having because the ball flies
   through air: `CONFIG.air` adds quadratic drag and a Magnus force, both written
