@@ -31,8 +31,13 @@ terminal reward, so there's no temporal credit assignment.
   batch, and frozen in the actor) and learns a launch action. It imitates only
   the actions that beat the critic's value estimate (positive advantage), a form
   of self-imitation / advantage-weighted regression.
-- **Reward** — a made basket scores far and away the highest (bonused by shot
-  distance), where "made" means the ball's centre crossed the rim's plane
+- **Reward** — a made basket scores far and away the highest, and every make is
+  worth the same wherever it was taken from: the agent never picks its spawn,
+  so a distance bonus cannot change any decision it makes — it only puts the
+  shot's distance into the reward, where the critic has to fit it and the
+  actor's advantage weighting reads it as if it were the shot's quality
+  (`CONFIG.reward.scoreDistanceBonus` restores it). "Made" means the ball's
+  centre crossed the rim's plane
   descending and inside the hole — the hole minus the ball, 0.30ft
   (`CONFIG.hoopEntry.scoreRadius`), not merely somewhere near the rim; near misses are shaped by how close the ball got to the rim, with
   small bonuses for hitting the rim or backboard. Direction through the hoop is
