@@ -67,7 +67,10 @@ moves when the curriculum opens the floor. Per zone it is.
 
 `score.mjs` ranks on `0.5 * finalAcc + 0.5 * auc`, where `finalAcc` is mean
 accuracy over the last quarter of the run and `auc` is mean accuracy across
-every batch — a config has to reach a good policy *and* get there early to win.
+every batch. Both are the behaviour policy's; the table carries the same two
+numbers over the greedy balls alone (`greedy`, `g-auc`) beside them, so a
+config that only looks better because it explores less shows up as one whose
+greedy accuracy did not move — a config has to reach a good policy *and* get there early to win.
 See the header comment there for why the speed half is counted in batches, when
 to use `--minutes` instead, and what the noise floor on a batch's accuracy is.
 
