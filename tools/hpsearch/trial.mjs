@@ -88,6 +88,10 @@ export async function runTrial({
       if (state.done) {
         const backendUsed = state.backend;
         const rows = await page.evaluate("window.__HP.batches");
+        // Carried out of the page rather than restated here: the shot chart's
+        // buckets and the NBA rates they are read against live in script.js,
+        // and a second copy in the harness is a second thing to keep in step.
+        const zoneMeta = await page.evaluate("window.__HP.zoneMeta");
         return {
           config,
           seed,
@@ -96,6 +100,7 @@ export async function runTrial({
           backend: backendUsed,
           wallMs: Date.now() - started,
           errors: errors.slice(0, 5),
+          zoneMeta,
           rows
         };
       }

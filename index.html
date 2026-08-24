@@ -57,6 +57,10 @@
     <div class="stat-row"><span>Policy Sigma:</span> <span id="policy-std">--</span></div>
     <div class="stat-row"><span>Status:</span> <span id="status">Manual Mode</span></div>
     <div class="stat-row"><span>Batch:</span> <span id="batch-progress">0/32</span></div>
+    <h3>Shot Chart (greedy)</h3>
+    <div class="stat-row zone-head"><span>Zone</span> <span>Agent</span> <span>NBA best</span></div>
+    <!-- Rows are built by Dashboard from SHOT_ZONES. -->
+    <div id="shot-chart"></div>
     <button id="toggle-train">START TRAINING</button>
     <button id="export-btn" style="background: #333; margin-top: 5px; border: 1px solid #555;">EXPORT POLICY</button>
     <button id="import-btn" style="background: #333; margin-top: 5px; border: 1px solid #555;">IMPORT POLICY</button>

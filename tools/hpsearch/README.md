@@ -48,11 +48,29 @@ and whichever comes first ends the run. Finished trials are written out one at a
 time, and re-running a stage skips the trials already on disk, so an interrupted
 stage picks up where it stopped.
 
+## The shot chart
+
+Every trial row carries per-zone attempt and make counts (`rows[i].zones`), cut
+into the buckets the NBA's own shot charts use, and the trial file carries the
+zone definitions and the league rates alongside them. `chart.mjs` pools them
+over the tail of a run and prints the comparison:
+
+```sh
+node chart.mjs --tail 0.25 results/nba/baseline.s1.json
+```
+
+A run's `acc` is pooled over a spawn disc that reaches half court, so it is not
+comparable to any shooting number a basketball reference would print, and it
+moves when the curriculum opens the floor. Per zone it is.
+
 ## Scoring
 
 `score.mjs` ranks on `0.5 * finalAcc + 0.5 * auc`, where `finalAcc` is mean
 accuracy over the last quarter of the run and `auc` is mean accuracy across
-every batch — a config has to reach a good policy *and* get there early to win.
+every batch. Both are the behaviour policy's; the table carries the same two
+numbers over the greedy balls alone (`greedy`, `g-auc`) beside them, so a
+config that only looks better because it explores less shows up as one whose
+greedy accuracy did not move — a config has to reach a good policy *and* get there early to win.
 See the header comment there for why the speed half is counted in batches, when
 to use `--minutes` instead, and what the noise floor on a batch's accuracy is.
 

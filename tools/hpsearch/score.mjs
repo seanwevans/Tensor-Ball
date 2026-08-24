@@ -28,12 +28,21 @@ export function summarize(record) {
 
   const finalAcc = mean(tail.map((r) => r.acc));
   const auc = mean(rows.map((r) => r.acc));
+  // The same two numbers over the greedy balls alone — the policy's own shooting
+  // rather than the policy's plus whatever spread it is currently exploring at.
+  // Ranked on `acc` still, because that is what every stage on disk was ranked
+  // on, but a config that only looks better because it explores less shows up
+  // here as one whose greedy accuracy did not move.
+  const greedy = rows.map((r) => r.accGreedy).filter((v) => v != null);
+  const greedyTail = tail.map((r) => r.accGreedy).filter((v) => v != null);
   return {
     name: record.name,
     seed: record.seed,
     batches: rows.length,
     finalAcc,
     auc,
+    finalGreedy: greedyTail.length ? mean(greedyTail) : null,
+    greedyAuc: greedy.length ? mean(greedy) : null,
     score: 0.5 * finalAcc + 0.5 * auc,
     startAcc: mean(rows.slice(0, Math.max(1, Math.floor(rows.length * 0.25))).map((r) => r.acc)),
     finalReward: mean(tail.map((r) => r.meanReward)),
@@ -67,6 +76,8 @@ export function rank(records) {
       score: avg("score"),
       finalAcc: avg("finalAcc"),
       auc: avg("auc"),
+      finalGreedy: avg("finalGreedy"),
+      greedyAuc: avg("greedyAuc"),
       startAcc: avg("startAcc"),
       finalAccSpread: spread("finalAcc"),
       finalReward: avg("finalReward"),
@@ -82,7 +93,7 @@ export function rank(records) {
 export function table(ranked) {
   const pct = (v) => (v == null ? "  --  " : (v * 100).toFixed(2).padStart(6));
   const head =
-    "config                  score   final    auc   start  spread  reward   d10  illegal   min   s/batch";
+    "config                  score   final    auc  greedy  g-auc   start  spread  reward   d10  illegal   min   s/batch";
   const lines = ranked.map((r) =>
     r.failed
       ? `${r.name.padEnd(22)}  FAILED: ${String(r.failed).slice(0, 90)}`
@@ -91,6 +102,8 @@ export function table(ranked) {
           pct(r.score),
           pct(r.finalAcc),
           pct(r.auc),
+          pct(r.finalGreedy),
+          pct(r.greedyAuc),
           pct(r.startAcc),
           pct(r.finalAccSpread),
           (r.finalReward ?? 0).toFixed(2).padStart(6),
