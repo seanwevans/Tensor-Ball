@@ -310,9 +310,42 @@ const CONFIG = {
   // alone made it score better than every honest miss in the batch — a shape
   // the policy can exploit by learning to fire straight up through the net.
   reward: {
-    // Made basket, bonused by how far out the shot was launched from.
+    // Made basket. Flat: every make is worth the same wherever it was taken
+    // from.
     score: 25.0,
-    scoreDistanceScale: 20.0,
+    // Extra reward per foot of shot distance, on top of it. Zero, and the
+    // reason is that the agent never chooses where it shoots from.
+    //
+    // A three being worth more than a layup is a statement about shot
+    // selection, and this agent has none: the spawn is drawn for it, it takes
+    // the shot it is given, and no action it can pick changes how far out it
+    // is standing. So a distance bonus cannot change a single decision the
+    // policy makes. What it does instead is put the shot's *distance* into the
+    // reward, where two things downstream read it as if it were the shot's
+    // quality.
+    //
+    // The critic has to fit it. Value is what the reward will be, so a term
+    // that swings the reward of a make from 27.5 to 85 across the disc is
+    // variance the value head has to spend capacity explaining before it can
+    // say anything about whether a state is a good one.
+    //
+    // And the actor is weighted by it. _advantageWeight is exp of the
+    // advantage in units of the batch's own spread, and the advantage of a
+    // make is dominated by the reward of the make: at 1.25/ft two makes 35ft
+    // apart differ by 43.75 of reward against a batch advantage spread
+    // measured around 12-22, so the far one pulls the policy several times
+    // harder than the near one for no reason but where each was standing. The
+    // shots that pull hardest are then the longest ones, which are the ones
+    // whose makes carry the least information about what a good action is —
+    // the achievable make rate out there is low, so a make from 45ft is mostly
+    // a lucky draw from a wide sampling distribution, and the update is
+    // weighted toward imitating exactly that.
+    //
+    // Flat makes every basket worth the same, which is what a make rate
+    // measures, and leaves the advantage a reading of the shot rather than of
+    // the spawn. Left parameterised — 1.25 restores the old scale — because
+    // "does valuing the three help" is a real question tools/hpsearch can ask.
+    scoreDistanceBonus: 0.0,
     // Flat penalty for entering the hoop from below, applied instead of the
     // rim/backboard bonuses. Deep enough to sit well below the worst honest
     // miss, whose proximity term bottoms out near -5.
@@ -3397,7 +3430,7 @@ class TrainingArena {
     );
     const R = CONFIG.reward;
     if (b.scored) {
-      const reward = R.score * (1.0 + shotDistance / R.scoreDistanceScale);
+      const reward = R.score + R.scoreDistanceBonus * shotDistance;
       return { reward, type: "score" };
     }
     const proximity = -b.minDist / R.missDistanceScale;
