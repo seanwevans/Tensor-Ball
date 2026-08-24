@@ -402,6 +402,39 @@ const CONFIG = {
     backboard: 0.5,
     missDistanceScale: 10.0
   },
+  // Where the shot leaves from, in feet — which is also where the eyes are,
+  // since the stereo pair rides the ball.
+  //
+  // This was `4.5 + Math.random() * 1.5`: uniform over a foot and a half,
+  // centred on 5.25ft. Nobody in the league sees the rim from 4.5ft, and the
+  // shape was wrong as well as the place — uniform means a spawn is as likely
+  // at the very bottom of the range as in the middle of it, which no
+  // population of people is.
+  //
+  // So draw it from the league. NBA stature is close to normal at 6'6.5"
+  // +/- 3.5in, and standing eye height is a shade under 94% of stature — the
+  // eyes sit about 5in below the top of the head — which puts 78.5in of player
+  // behind 73.5in of eye.
+  //
+  // Two things fall out of it beyond the realism. The spread narrows, from
+  // 0.43ft of standard deviation to 0.27ft: launch height is a confound in the
+  // vision, because the elevation the rim sits at in the frame depends on how
+  // far away it is *and* on how high the camera is, and the agent has to
+  // separate the two from the same pixels. And the mean rises by ~0.9ft, which
+  // takes about that much off the climb every shot has to make.
+  //
+  // The stereo geometry was already a real head's — CONFIG.ipd is 63mm — and
+  // it now sits at a real head's height.
+  spawnHeight: {
+    mean: 6.12,
+    stdDev: 0.27,
+    // The ends of an NBA roster rather than a z-score: a 5'9" guard and a 7'4"
+    // centre, which is 5.38ft and 6.86ft of eye. Draws outside are redrawn
+    // (see spawnEyeHeight), so the tails are cut rather than piled onto the
+    // bounds.
+    min: 5.38,
+    max: 6.86
+  },
   // Calling a sensor crossing "came up through the hoop" takes more than an
   // upward velocity: a ball rattling on the rim from above can clip the sensor
   // while bouncing back up. Require real ascent, and require the ball to be in
@@ -516,6 +549,30 @@ const UP = new THREE.Vector3(0, 1, 0);
 // here, a range there, and the physics to apply it.
 const ACTION = { fwd: 0, up: 1, side: 2, spin: 3 };
 const ACTION_DIM = 4;
+
+// Standard normal, Box-Muller. Shared by the policy's exploration draws and by
+// the spawn height, which are the two places in the app that want a bell
+// rather than a box.
+function gauss() {
+  const u = 1 - Math.random();
+  const v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// A shooter's eye height, drawn from the league. See CONFIG.spawnHeight.
+//
+// Redrawn rather than clamped when a draw lands outside the roster's ends, so
+// the distribution is a truncated normal and not a normal with a spike on each
+// bound. The retry count is bounded and falls back to the clamp, so a config
+// with min above max cannot hang a batch of a thousand balls.
+function spawnEyeHeight() {
+  const S = CONFIG.spawnHeight;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const y = S.mean + gauss() * S.stdDev;
+    if (y >= S.min && y <= S.max) return y;
+  }
+  return Math.min(S.max, Math.max(S.min, S.mean));
+}
 
 class Assets {
   constructor() {
@@ -1265,12 +1322,6 @@ class CNNAgent {
     return m;
   }
 
-  static _gauss() {
-    const u = 1 - Math.random();
-    const v = Math.random();
-    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-  }
-
   predictBatch(pixelDataBatch, greedyCount = 0) {
     return tf.tidy(() => {
       const count = pixelDataBatch.length / this.frameSize;
@@ -1294,7 +1345,7 @@ class CNNAgent {
         const a = [];
         for (let k = 0; k < ACTION_DIM; k++) {
           const j = i * ACTION_DIM + k;
-          const g = CNNAgent._gauss();
+          const g = gauss();
           const spread = i < greedyCount ? 0 : stdData[j];
           a.push(clamp(meanData[j] + spread * g));
         }
@@ -2609,7 +2660,7 @@ class Ball {
         z = rim.z;
       }
     }
-    const y = 4.5 + Math.random() * 1.5;
+    const y = spawnEyeHeight();
     this.body.position.set(x, y, z);
     this.body.velocity.set(0, 0, 0);
     this.body.angularVelocity.set(0, 0, 0);
@@ -3495,7 +3546,8 @@ class TrainingArena {
         Math.abs(b.body.position.x) > 50 || Math.abs(b.body.position.z) > 30;
       // Terminate the moment the ball reaches floor level. It rests at
       // y == ballRadius on the (infinite) floor plane and every shot launches
-      // from y >= 4.5, so this only fires once a shot has come back down —
+      // from CONFIG.spawnHeight.min, a shooter's eyes above it, so this only
+      // fires once a shot has come back down —
       // culling missed shots on first floor contact instead of letting them
       // bounce and roll to a stop. Made shots still end via b.scored at the
       // hoop, well above the floor. (Replaces the old y < -2 check, which the
@@ -3683,7 +3735,7 @@ class ManualBall {
     this.prevZ = null;
     const x = Math.random() * 42;
     const z = (Math.random() - 0.5) * 46;
-    const y = 4.5 + Math.random() * 1.5;
+    const y = spawnEyeHeight();
     this.body.position.set(x, y, z);
     this.body.velocity.set(0, 0, 0);
     this.body.angularVelocity.set(0, 0, 0);
