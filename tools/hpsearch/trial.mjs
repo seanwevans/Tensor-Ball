@@ -4,7 +4,8 @@
 //                  --set exploreNoise=0.9 --out result.json
 //
 // --batches caps the run by batch count, --minutes caps it by wall clock;
-// give both and whichever comes first ends the run.
+// give both and whichever comes first ends the run. --timeout is the separate
+// limit on the whole trial, after which it is abandoned with nothing written.
 //
 // Prints a JSON result to stdout (and to --out): the config that ran, the
 // backend that served it, and one row of metrics per trained batch.
@@ -49,6 +50,12 @@ export async function runTrial({
   batches = 20,
   budgetMs = 0,
   backend = null,
+  // The trial is abandoned after this long, and an abandoned trial writes no
+  // result at all, because the JSON is produced once at the end. 45 minutes is
+  // comfortable for a run with the machine to itself and is not comfortable
+  // for one sharing it: two 150-batch runs that would each have finished in 25
+  // minutes alone took 45 to reach batch 131 together and both died there with
+  // nothing on disk. Raise it when running trials concurrently.
   timeoutMs = 45 * 60 * 1000,
   onBatch = null
 } = {}) {
@@ -116,7 +123,14 @@ export async function runTrial({
 
 async function main() {
   const argv = process.argv.slice(2);
-  const opts = { config: {}, seed: 1, batches: 20, budgetMs: 0, backend: null };
+  const opts = {
+    config: {},
+    seed: 1,
+    batches: 20,
+    budgetMs: 0,
+    backend: null,
+    timeoutMs: 45 * 60 * 1000
+  };
   let out = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -124,6 +138,7 @@ async function main() {
     else if (a === "--seed") opts.seed = Number(argv[++i]);
     else if (a === "--batches") opts.batches = Number(argv[++i]);
     else if (a === "--minutes") opts.budgetMs = Number(argv[++i]) * 60000;
+    else if (a === "--timeout") opts.timeoutMs = Number(argv[++i]) * 60000;
     else if (a === "--backend") opts.backend = argv[++i];
     else if (a === "--out") out = argv[++i];
     else if (a === "--config") Object.assign(opts.config, JSON.parse(argv[++i]));
