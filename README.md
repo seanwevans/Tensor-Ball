@@ -28,9 +28,14 @@ terminal reward, so there's no temporal credit assignment.
 
 - **Critic** — a CNN that predicts the expected reward (value) of a state.
 - **Actor** — shares the critic's convolutional backbone (copied over after each
-  batch, and frozen in the actor) and learns a launch action. It imitates only
-  the actions that beat the critic's value estimate (positive advantage), a form
-  of self-imitation / advantage-weighted regression.
+  batch, and frozen in the actor) and learns a launch action. It imitates the
+  best slice of each batch by advantage — `CONFIG.imitateFraction`, the top
+  fifth — a form of self-imitation / advantage-weighted regression. The bar is
+  set by the batch rather than by the critic's zero, because a miss is worth
+  about -0.3 and a make about +25: once the policy makes anything the value
+  head sits above every miss, a sign gate admits exactly the makes, and the
+  shot that rattled out is discarded on the same grounds as the one that sailed
+  into the third row.
 - **Reward** — a made basket scores far and away the highest (bonused by shot
   distance), where "made" means the ball's centre crossed the rim's plane
   descending and inside the hole — the hole minus the ball, 0.30ft

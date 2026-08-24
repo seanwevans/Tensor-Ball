@@ -122,6 +122,37 @@ const CONFIG = {
   evalBalls: 128,
   advantageTemp: 1.0,
   advantageClip: 20.0,
+  // Share of the batch the actor imitates, taken from the top by advantage.
+  //
+  // The gate used to be the sign of the advantage: imitate every shot that
+  // beat the critic, ignore the rest. That reads as "learn from what went
+  // better than expected", but what it actually does is hand the size of the
+  // update to the critic's calibration, and in this environment the
+  // calibration walks off in one direction and stays there.
+  //
+  // A miss is worth about -0.3 and a make about +25, so once the policy makes
+  // anything at all the value head sits well above the miss reward and *every*
+  // miss has a negative advantage. The gate then admits exactly the makes and
+  // nothing else, whatever the misses did — the shot that rattled out and the
+  // shot that sailed into the third row are both excluded, on the same
+  // grounds, by the same amount. Everything the reward measured about a miss
+  // is computed, fitted by the critic, and then dropped on the floor by the
+  // actor. And in the batches that matter most, the early ones where a make is
+  // one shot in a hundred, that leaves an update built from a handful of
+  // samples.
+  //
+  // Gate on the batch instead: imitate the best of what this batch actually
+  // did. Where makes are plentiful the top fifth is all makes and this is the
+  // old behaviour; where they are rare it is the makes plus the shots that
+  // came closest, which is the signal the proximity shaping was written to
+  // provide. Their weighted mean is not a worse target for being made of
+  // misses — a shot long by a foot and a shot short by a foot average to the
+  // one in between, which is the make.
+  //
+  // It also fixes the size of the evidence. Every batch imitates the same
+  // number of shots whether the critic is calibrated or not, so the update
+  // cannot quietly shrink to nothing because the value head drifted.
+  imitateFraction: 0.2,
   // Passes the critic makes over the batch it just collected. The critic is
   // what turns a reward into an advantage, so an underfit critic hands the
   // actor something close to "reward minus batch mean" and the imitation
@@ -1189,10 +1220,29 @@ class CNNAgent {
   //
   // It also gives advMean a job again. It was still being passed in and
   // ignored, which is the shape of a term dropped by accident.
-  _advantageWeight(advantage, advMean, advStd) {
-    if (advantage <= 0) return 0;
+  _advantageWeight(advantage, advMean, advStd, gate) {
+    if (advantage < gate) return 0;
     const z = (advantage - advMean) / advStd;
     return Math.min(CONFIG.advantageClip, Math.exp(z / CONFIG.advantageTemp));
+  }
+
+  // The advantage a shot has to reach to be imitated: the batch's own
+  // (1 - imitateFraction) quantile. See CONFIG.imitateFraction for why the bar
+  // is set by the batch rather than by the critic's zero.
+  //
+  // Measured over the balls the actor is allowed to learn from, so the eval
+  // slice — which is held out of the update either way — cannot move the bar
+  // the rest of the batch is held to.
+  static _advantageGate(advantages, from, to) {
+    const n = to - from;
+    if (n <= 0) return 0;
+    const sorted = advantages.slice(from, to);
+    sorted.sort();
+    const k = Math.min(
+      n - 1,
+      Math.max(0, Math.floor(n * (1 - CONFIG.imitateFraction)))
+    );
+    return sorted[k];
   }
 
   async train() {
@@ -1260,18 +1310,19 @@ class CNNAgent {
     // They still fit the critic, and they are still admitted to replay: by the
     // time a stored shot is drawn again the actor has moved, its action is no
     // longer the mean, and it carries an ordinary gradient on both.
+    const gate = CNNAgent._advantageGate(advantageData, greedyCount, batchSize);
     const weightData = new Float32Array(batchSize);
     for (let i = 0; i < batchSize; i++)
       weightData[i] =
         i < greedyCount
           ? 0
-          : this._advantageWeight(advantageData[i], advMean, advStd);
+          : this._advantageWeight(advantageData[i], advMean, advStd, gate);
     const weightTensor = tf.tensor1d(weightData);
 
     // Train the actor end-to-end across its conv backbone and dense head
     this._fitActorWeighted(stateTensor, actionTensor, weightTensor);
 
-    this._replayPass(advMean, advStd);
+    this._replayPass(advMean, advStd, gate);
     this._admitToReplay(states, actions, rewards, advantageData);
 
     stateTensor.dispose();
@@ -1284,7 +1335,11 @@ class CNNAgent {
     return loss;
   }
 
-  _replayPass(advMean, advStd) {
+  // gate: the bar this batch set. A stored shot has to clear the same one the
+  // live batch does — the buffer holds the best shots of the batches it was
+  // filled from, and a policy that has since got better should stop being
+  // pulled back toward them.
+  _replayPass(advMean, advStd, gate) {
     if (!this.replay) return;
     const draw = this.replay.sample(CONFIG.replay.samplesPerBatch);
     if (!draw) return;
@@ -1303,7 +1358,12 @@ class CNNAgent {
     const repriced = new Float32Array(draw.count);
     for (let i = 0; i < draw.count; i++) {
       repriced[i] = draw.rewards[i] - valueData[i];
-      weightData[i] = this._advantageWeight(repriced[i], advMean, advStd);
+      weightData[i] = this._advantageWeight(
+        repriced[i],
+        advMean,
+        advStd,
+        gate
+      );
     }
     // The advantage just computed is the entry's price under the current
     // critic. See ReplayBuffer.reprice.
