@@ -37,7 +37,7 @@ const BOOT_HOOK = `
 if (typeof window !== "undefined" && window.__hpInstall) {
   window.__hpInstall({
     CONFIG, App, TrainingArena, CNNAgent, SceneManager, Dashboard,
-    VisionSystem, TrajectoryTrails, Ball, tf
+    VisionSystem, TrajectoryTrails, Ball, tf, SHOT_ZONES, shotZone
   });
 }
 window.__APP = new App();

@@ -89,6 +89,47 @@ added to the court is one paid two thousand times a batch.
 The live dashboards show the agent's stereo input, the learned first-layer
 filters, dense-layer activations, the critic's batch loss, and running accuracy.
 
+### Reading the accuracy: the shot chart
+
+The headline accuracy is one make rate pooled over the whole spawn disc, and
+once the curriculum has opened that disc it reaches half court. Over a third of
+every batch is then launched from beyond 30ft — territory the NBA takes about
+one shot in two hundred from, most of them buzzer heaves. A number pooled over
+2ft layups and 45ft heaves has no counterpart in any box score, and it drops
+whenever the curriculum opens the floor rather than when the policy gets worse.
+
+So the dashboard also carries a **shot chart**: the same shots split into the
+buckets the league's own charts use — restricted area, paint, mid-range, corner
+three, above the break — with what the best shooters in the NBA manage from
+each alongside. Every zone is scored on the greedy balls only
+(`CONFIG.evalBalls`), because parity with a shooter is a claim about the policy,
+not about the policy plus however wide it is currently exploring.
+
+| Zone | League | Elite |
+| --- | --- | --- |
+| Restricted area (inside 4ft) | ~65% | ~70% |
+| Paint, outside the restricted arc | ~42% | ~50% |
+| Mid-range | ~41% | ~50% |
+| Corner three | ~39% | ~45% |
+| Above the break three | ~36% | ~42% |
+| Beyond 30ft | — | — |
+
+Those are game rates, shot against a defence, off the dribble, on a shot clock.
+An agent alone in a gym with nobody's hand in its face should be expected to
+beat them — and until it reaches them it is not close. Beyond 30ft has no
+benchmark on purpose: there is no NBA rate worth being at parity with out
+there.
+
+Zones are cut on the lines already painted on the floor — the same `COURT`
+constants `Court._buildMarkings` draws from, so a spawn is judged against the
+line it is standing next to. Each zone averages over its own last
+`CONFIG.zoneWindow` shots rather than a shared window: the spawn disc is
+area-uniform, so the restricted area collects about one shot for every thirty
+from beyond the arc, and a window measured in batches would leave it reading
+nothing for most of a run.
+
+`tools/hpsearch/chart.mjs` prints the same table for a finished headless run.
+
 ### Batch size vs. retina resolution
 
 The two are budgeted against each other in `CONFIG`, because every buffer in

@@ -189,3 +189,29 @@ button.active {
   text-align: right;
   margin-top: 5px;
 }
+
+/* Shot chart. Three columns rather than the two-column .stat-row default:
+   zone, what the agent shoots from it, and the bar it is chasing. */
+#training-ui .zone-head,
+#training-ui .zone-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+#training-ui .zone-head {
+  color: #888;
+  border-bottom: 1px solid #444;
+  padding-bottom: 2px;
+}
+
+#training-ui .zone-row span:nth-child(2) {
+  text-align: right;
+  min-width: 34px;
+}
+
+#training-ui .zone-bench {
+  color: #888;
+  text-align: right;
+  min-width: 34px;
+}

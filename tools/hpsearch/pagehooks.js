@@ -47,6 +47,10 @@
     // a clock, not on a batch count.
     budgetMs: P.budgetMs || 0,
     cur: null,
+    // The shot chart's buckets and their NBA benchmarks, copied out of the app
+    // so a report can print the comparison without a second copy of the
+    // numbers to keep in step.
+    zoneMeta: [],
     done: false,
     t0: 0,
     tPrev: 0,
@@ -59,6 +63,12 @@
     sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] : null;
 
   window.__hpInstall = (TB) => {
+    H.zoneMeta = TB.SHOT_ZONES.map((z) => ({
+      key: z.key,
+      label: z.label,
+      league: z.league,
+      elite: z.elite
+    }));
     if (P.backend) {
       const setBackend = TB.tf.setBackend.bind(TB.tf);
       TB.tf.setBackend = () => setBackend(P.backend);
@@ -78,12 +88,26 @@
         c.rewardSum += r.reward;
         c.types[r.type] = (c.types[r.type] || 0) + 1;
         c.dists.push(ball.minDist);
+        // Which of the league's shot-chart buckets this attempt came from, so
+        // a run can be scored the way a shooter is rather than on one number
+        // pooled over layups and half-court heaves. Counted for every ball and
+        // again for the greedy ones, because the two answer different
+        // questions and a zone is thin enough on its own without discarding
+        // seven eighths of it.
+        const zone = TB.shotZone(ball.spawnX, ball.spawnZ, this.hoopPos);
+        const z = (c.zones[zone] ??= { n: 0, made: 0, evalN: 0, evalMade: 0 });
+        z.n++;
+        if (r.type === "score") z.made++;
         // The batch's greedy sample, graded on its own. `acc` below is the
         // behaviour policy — policy plus exploration noise — so on its own it
         // cannot say whether a config improved the policy or just annealed.
         if (ball.isEval) {
           c.evalN++;
-          if (r.type === "score") c.evalScore++;
+          z.evalN++;
+          if (r.type === "score") {
+            c.evalScore++;
+            z.evalMade++;
+          }
         }
       }
       return r;
@@ -106,7 +130,8 @@
         dists: [],
         loss: null,
         evalN: 0,
-        evalScore: 0
+        evalScore: 0,
+        zones: {}
       };
       const noise = this.exploreNoise;
       try {
@@ -141,6 +166,10 @@
         // between configs at the same radius, so a curriculum run has to
         // report it alongside.
         spawnRadius: this.spawnRadius,
+        // Per shot-chart zone: attempts and makes, for the batch and for its
+        // greedy slice. Counts rather than rates, so a report can pool them
+        // across as many batches as a zone needs to be readable.
+        zones: c.zones,
         // Simulation of this batch's shots (between the previous finishBatch
         // and this one) vs. reward + train + next capture inside it.
         simMs: tStart - H.tPrev,
