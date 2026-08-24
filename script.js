@@ -23,7 +23,8 @@ const CONFIG = {
   // higher-resolution configs were tuned to.
   //
   // 96px is also about the floor for the stereo channel to mean anything. One
-  // pixel of disparity from the 63mm IPD below needs ipd * f_px / d >= 1,
+  // pixel of disparity on the rim from the 63mm IPD below needs
+  // ipd * f_px / d >= 1,
   // where f_px = (W/2) / tan(fov/2) = 83.1 at 96px / 60deg: that is ~1.7px at
   // 10ft and ~0.86px at 20ft. Mid-range shots clear it, the far corners do
   // not. Going below ~64px makes disparity sub-pixel everywhere and the second
@@ -2590,12 +2591,35 @@ class VisionSystem {
   }
 
   // Fills both atlases with the stereo views of balls[start, end).
+  //
+  // The two eyes look along the *same* direction — the ball-to-hoop axis —
+  // rather than each turning in onto the rim.
+  //
+  // Both cameras used to lookAt(hoopPos), which verges them on the target. That
+  // puts the rim dead centre in both images at every distance, which is to say
+  // it gives the rim a stereo disparity of exactly zero from 2ft and from 45ft
+  // alike. The one object in the frame that is high-contrast, unoccluded,
+  // always visible and always the thing being aimed at is then the one object
+  // carrying no depth at all, and what is left of the stereo channel is the
+  // background's disparity *relative* to a rim whose distance is the unknown
+  // being solved for.
+  //
+  // Vergence is a depth cue for eyes because the angle between them is
+  // proprioceptively known. Here it is not in the state — the agent sees two
+  // images and nothing about how the cameras were aimed — so verging does not
+  // encode the distance, it subtracts it out.
+  //
+  // Parallel axes put it back where the textbook has it: the rim lands at
+  // +/- f * ipd / 2Z either side of centre, so the disparity across the pair is
+  // f * ipd / Z directly. At 96px and this ipd that is 17.2/Z pixels — 1.4px at
+  // the free-throw line, and still something to read at the arc.
   _renderPass(balls, start, end, hoopPos) {
     const { W, H, cols } = this;
     const half = CONFIG.ipd / 2;
     const dir = new THREE.Vector3();
     const rightVec = new THREE.Vector3();
     const offset = new THREE.Vector3();
+    const target = new THREE.Vector3();
 
     for (let i = start; i < end; i++) {
       const pos = balls[i].position;
@@ -2605,8 +2629,10 @@ class VisionSystem {
 
       this.camLeft.position.copy(pos).sub(offset);
       this.camRight.position.copy(pos).add(offset);
-      this.camLeft.lookAt(hoopPos);
-      this.camRight.lookAt(hoopPos);
+      // Aim each eye one unit down its own copy of the shared axis, which is
+      // what makes the axes parallel rather than convergent.
+      this.camLeft.lookAt(target.copy(this.camLeft.position).add(dir));
+      this.camRight.lookAt(target.copy(this.camRight.position).add(dir));
 
       const tile = i - start;
       const tileX = (tile % cols) * W;

@@ -13,7 +13,9 @@ the critic learns the cloud pulls in toward the rim.
 
 ## What it is
 
-Each ball carries a pair of stereo cameras pointed at the rim. Every training
+Each ball carries a pair of stereo cameras aimed down the line to the rim —
+parallel, not verged onto it, so the rim's own disparity across the pair is the
+distance to it rather than zero. Every training
 batch, the agent renders each ball's view, feeds the two grayscale images through
 a small convolutional network, and outputs a 4-vector launch action (vertical
 power, forward power, aim adjustment, spin) — `CONFIG.launch` is the envelope
