@@ -128,10 +128,27 @@ const CONFIG = {
   // actor something close to "reward minus batch mean" and the imitation
   // weights stop depending on the state at all.
   criticEpochs: 1,
-  // Minibatch for the actor's weighted-regression pass. The batch is walked
-  // once either way, so this trades the size of each Adam step against how many
-  // of them a batch buys.
+  // Minibatch for the actor's weighted-regression pass. The weighted samples
+  // are walked once either way, so this trades the size of each Adam step
+  // against how many of them a batch buys.
   actorMinibatch: 32,
+  // Passes the actor makes over the samples it is allowed to imitate.
+  //
+  // The actor used to walk the whole batch, minibatch by minibatch, and most
+  // of every minibatch was samples whose weight is zero — the misses, which
+  // the update gates out. At a quarter of the batch making it through the
+  // gate, a minibatch of 32 carried about eight samples that could move a
+  // gradient and twenty-four that could not, and the twenty-four were rendered
+  // through the conv stack forwards and backwards anyway. Four fifths of the
+  // most expensive thing in the run, spent on pixels that multiply by nought.
+  //
+  // Walking only the weighted samples fixes both halves of that: each step
+  // costs a fifth of what it did, and each step is fitted on 32 shots that
+  // carry evidence rather than 8. What it does not do on its own is keep the
+  // number of Adam steps a batch buys, which falls by the same factor — hence
+  // this. One pass is the cheap setting, and it is still the same number of
+  // *samples* per batch as before; more passes trade compute back for steps.
+  actorEpochs: 1,
   // Self-imitation replay.
   //
   // train() ends with `this.memory = null`, so every shot the agent has ever
@@ -1384,10 +1401,9 @@ class CNNAgent {
         i < greedyCount
           ? 0
           : this._advantageWeight(advantageData[i], advMean, advStd);
-    const weightTensor = tf.tensor1d(weightData);
 
     // Train the actor end-to-end across its conv backbone and dense head
-    this._fitActorWeighted(stateTensor, actionTensor, weightTensor);
+    this._fitActorWeighted(stateTensor, actionTensor, weightData);
 
     this._replayPass(advMean, advStd);
     this._admitToReplay(states, actions, rewards, advantageData);
@@ -1397,7 +1413,6 @@ class CNNAgent {
     rewardTensor.dispose();
     values.dispose();
     advantages.dispose();
-    weightTensor.dispose();
     this.memory = null;
     return loss;
   }
@@ -1426,14 +1441,12 @@ class CNNAgent {
     // The advantage just computed is the entry's price under the current
     // critic. See ReplayBuffer.reprice.
     this.replay.reprice(draw.slots, repriced);
-    const weights = tf.tensor1d(weightData);
 
-    this._fitActorWeighted(states, actions, weights);
+    this._fitActorWeighted(states, actions, weightData);
 
     states.dispose();
     actions.dispose();
     values.dispose();
-    weights.dispose();
   }
 
   _admitToReplay(states, actions, rewards, advantageData) {
@@ -1451,29 +1464,50 @@ class CNNAgent {
     }
   }
 
-  // Minibatch update with bounded sigma precision and weight-normalized loss
+  // Minibatch update with bounded sigma precision and weight-normalized loss.
+  //
+  // weights is a plain Float32Array over states' rows rather than a tensor:
+  // the sample list below is built from it on the CPU, and uploading a weight
+  // per row only to gather it back a minibatch at a time was a round trip for
+  // numbers that never left the host.
   _fitActorWeighted(states, actions, weights, minibatch = CONFIG.actorMinibatch) {
-    const n = states.shape[0];
-    const order = new Int32Array(n);
-    for (let i = 0; i < n; i++) order[i] = i;
-    for (let i = n - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const t = order[i];
-      order[i] = order[j];
-      order[j] = t;
-    }
+    // Only the samples the gate let through. Everything else contributes a
+    // term multiplied by zero — see CONFIG.actorEpochs for what carrying them
+    // through the conv stack was costing.
+    const kept = [];
+    for (let i = 0; i < weights.length; i++) if (weights[i] > 0) kept.push(i);
+    if (!kept.length) return;
+    const order = Int32Array.from(kept);
+    const n = order.length;
 
     const vars = this.actor.trainableWeights.map((w) => w.val);
+    for (let epoch = 0; epoch < CONFIG.actorEpochs; epoch++) {
+      for (let i = n - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+      }
+      this._actorPass(states, actions, weights, order, minibatch, vars);
+    }
+  }
+
+  _actorPass(states, actions, weights, order, minibatch, vars) {
+    const n = order.length;
     for (let start = 0; start < n; start += minibatch) {
       const slice = order.slice(start, Math.min(start + minibatch, n));
       tf.tidy(() => {
         const idx = tf.tensor1d(slice, "int32");
         const xb = tf.gather(states, idx);
         const yb = tf.gather(actions, idx);
-        const wb = tf.gather(weights, idx);
-
-        const weightSum = wb.sum().dataSync()[0];
+        const sliceWeights = new Float32Array(slice.length);
+        let weightSum = 0;
+        for (let i = 0; i < slice.length; i++) {
+          sliceWeights[i] = weights[slice[i]];
+          weightSum += sliceWeights[i];
+        }
         if (weightSum <= 1e-6) return;
+        const wb = tf.tensor1d(sliceWeights);
 
         this.actorOptimizer.minimize(
           () => {
