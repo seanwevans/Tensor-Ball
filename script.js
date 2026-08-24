@@ -23,7 +23,8 @@ const CONFIG = {
   // higher-resolution configs were tuned to.
   //
   // 96px is also about the floor for the stereo channel to mean anything. One
-  // pixel of disparity from the 63mm IPD below needs ipd * f_px / d >= 1,
+  // pixel of disparity on the rim from the 63mm IPD below needs
+  // ipd * f_px / d >= 1,
   // where f_px = (W/2) / tan(fov/2) = 83.1 at 96px / 60deg: that is ~1.7px at
   // 10ft and ~0.86px at 20ft. Mid-range shots clear it, the far corners do
   // not. Going below ~64px makes disparity sub-pixel everywhere and the second
@@ -340,9 +341,42 @@ const CONFIG = {
   // alone made it score better than every honest miss in the batch — a shape
   // the policy can exploit by learning to fire straight up through the net.
   reward: {
-    // Made basket, bonused by how far out the shot was launched from.
+    // Made basket. Flat: every make is worth the same wherever it was taken
+    // from.
     score: 25.0,
-    scoreDistanceScale: 20.0,
+    // Extra reward per foot of shot distance, on top of it. Zero, and the
+    // reason is that the agent never chooses where it shoots from.
+    //
+    // A three being worth more than a layup is a statement about shot
+    // selection, and this agent has none: the spawn is drawn for it, it takes
+    // the shot it is given, and no action it can pick changes how far out it
+    // is standing. So a distance bonus cannot change a single decision the
+    // policy makes. What it does instead is put the shot's *distance* into the
+    // reward, where two things downstream read it as if it were the shot's
+    // quality.
+    //
+    // The critic has to fit it. Value is what the reward will be, so a term
+    // that swings the reward of a make from 27.5 to 85 across the disc is
+    // variance the value head has to spend capacity explaining before it can
+    // say anything about whether a state is a good one.
+    //
+    // And the actor is weighted by it. _advantageWeight is exp of the
+    // advantage in units of the batch's own spread, and the advantage of a
+    // make is dominated by the reward of the make: at 1.25/ft two makes 35ft
+    // apart differ by 43.75 of reward against a batch advantage spread
+    // measured around 12-22, so the far one pulls the policy several times
+    // harder than the near one for no reason but where each was standing. The
+    // shots that pull hardest are then the longest ones, which are the ones
+    // whose makes carry the least information about what a good action is —
+    // the achievable make rate out there is low, so a make from 45ft is mostly
+    // a lucky draw from a wide sampling distribution, and the update is
+    // weighted toward imitating exactly that.
+    //
+    // Flat makes every basket worth the same, which is what a make rate
+    // measures, and leaves the advantage a reading of the shot rather than of
+    // the spawn. Left parameterised — 1.25 restores the old scale — because
+    // "does valuing the three help" is a real question tools/hpsearch can ask.
+    scoreDistanceBonus: 0.0,
     // Flat penalty for entering the hoop from below, applied instead of the
     // rim/backboard bonuses. Deep enough to sit well below the worst honest
     // miss, whose proximity term bottoms out near -5.
@@ -370,8 +404,92 @@ const CONFIG = {
   // their centre further than 0.30ft from the axis when they were credited, and
   // the median was 0.63ft: balls bouncing off the outside of the rim, each one
   // collecting +25 and the largest positive advantage in the batch.
-  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55, scoreRadius: 0.3 }
+  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55, scoreRadius: 0.3 },
+  // Shots a zone's make rate averages over. Each zone keeps its own window, so
+  // a rate is over the last N shots *from that zone* rather than the last N
+  // shots overall — the spawn disc is area-uniform, so the restricted area
+  // collects about one shot for every hundred from beyond the arc, and a
+  // window measured in batches would leave it reading nothing for most of a
+  // run while the deep bucket churned through thousands.
+  zoneWindow: 256
 };
+
+// The lines painted on the floor, as the numbers both the markings and the
+// shot chart are built from. Distances are from the middle of the ring, which
+// is how the rulebook states them and how Court._buildMarkings draws them.
+//
+// One set of numbers for both, because a zone test that disagreed with the arc
+// the ball actually flew over would be reporting on a court that isn't there.
+const COURT = {
+  // Free-throw line: 15ft from the backboard face, which is 4ft in from the
+  // baseline, putting it 13.75ft from the ring.
+  rimToFreeThrow: 13.75,
+  rimToBaseline: 5.25,
+  laneHalfWidth: 8,
+  restrictedRadius: 4,
+  threeRadius: 23.75,
+  cornerZ: 22,
+  // Where the arc meets the straight corner line, as a distance from the ring
+  // along the court.
+  get cornerBreak() {
+    return Math.sqrt(this.threeRadius ** 2 - this.cornerZ ** 2);
+  },
+  // Past this the shot stops having an NBA counterpart to be at parity with.
+  // The league takes about one shot in two hundred from beyond 30ft and most
+  // of them are buzzer heaves; this app's spawn disc, once the curriculum has
+  // opened it, puts more than half the batch out here.
+  deepRadius: 30
+};
+
+// The shot chart, in the league's own buckets, with what the league shoots
+// from each.
+//
+// The dashboard's headline accuracy is one number over a spawn distribution
+// that is uniform over the half court, and half of that court is further out
+// than the NBA takes shots from at all. "Parity with an NBA shooter" is not a
+// claim that number can carry: a make rate pooled over 2ft layups and 45ft
+// heaves has no counterpart in any box score, and it moves whenever the
+// curriculum opens the floor rather than whenever the policy improves. Split
+// it by the lines already on the floor and every piece of it has a counterpart.
+//
+// league is the NBA's own rate from the zone, elite roughly what the best
+// shooters in the league manage from it. Both are game rates, taken against a
+// defence, off the dribble, with a shot clock — an agent alone in a gym with
+// no hand in its face should be expected to beat them, and until it reaches
+// them it is not close.
+const SHOT_ZONES = [
+  { key: "restricted", label: "Restricted", league: 0.65, elite: 0.7 },
+  { key: "paint", label: "Paint", league: 0.42, elite: 0.5 },
+  { key: "mid", label: "Mid-range", league: 0.41, elite: 0.5 },
+  { key: "corner3", label: "Corner 3", league: 0.39, elite: 0.45 },
+  { key: "arc3", label: "Above break 3", league: 0.36, elite: 0.42 },
+  // No benchmark: see COURT.deepRadius.
+  { key: "deep", label: "Beyond 30ft", league: null, elite: null }
+];
+
+// Which of those a shot was taken from. Takes the launch spot rather than the
+// ball's first simulated position, so a spawn on a line is judged against the
+// line it was standing on and not against wherever one physics step of flight
+// had carried it.
+function shotZone(x, z, rim) {
+  const sign = rim.x < 0 ? -1 : 1;
+  // Positive out toward mid-court, negative behind the ring.
+  const out = (rim.x - x) * sign;
+  const side = Math.abs(z - rim.z);
+  const d = Math.hypot(x - rim.x, z - rim.z);
+
+  if (d <= COURT.restrictedRadius) return "restricted";
+  if (side >= COURT.cornerZ && out <= COURT.cornerBreak) return "corner3";
+  if (d >= COURT.threeRadius)
+    return d > COURT.deepRadius ? "deep" : "arc3";
+  if (
+    side <= COURT.laneHalfWidth &&
+    out <= COURT.rimToFreeThrow &&
+    out >= -COURT.rimToBaseline
+  )
+    return "paint";
+  return "mid";
+}
 
 const UP = new THREE.Vector3(0, 1, 0);
 
@@ -1906,10 +2024,15 @@ class Court {
 
       // Free-throw lane: 16ft wide, baseline to the free-throw line. The line
       // sits 15ft from the backboard face, which is 4ft in from the baseline.
-      const ftX = sign * 28;
-      rect(19, W, sign * 37.5, -8);
-      rect(19, W, sign * 37.5, 8);
-      rect(W, 16, ftX, 0);
+      // Every dimension below comes from COURT, which is also what shotZone
+      // judges a spawn against — the shot chart has to be scored on the lines
+      // that are actually painted here.
+      const lane = COURT.laneHalfWidth;
+      const ftX = rimX - sign * COURT.rimToFreeThrow;
+      const laneLen = COURT.rimToFreeThrow + COURT.rimToBaseline;
+      rect(laneLen, W, (ftX + baseX) / 2, -lane);
+      rect(laneLen, W, (ftX + baseX) / 2, lane);
+      rect(W, lane * 2, ftX, 0);
       // Free-throw circle. The half away from the basket is solid; the half
       // inside the lane is dashed, which is the way round the rulebook has it.
       arc(ftX, 0, 6, facing - Math.PI / 2, Math.PI);
@@ -1918,10 +2041,10 @@ class Court {
       // Three-point line. The arc is 23.75ft from the middle of the ring; the
       // corners are straight, 22ft out — 3ft in from the sideline — and run
       // back to the baseline from where they meet the arc.
-      const R3 = 23.75;
-      const CORNER = 22;
+      const R3 = COURT.threeRadius;
+      const CORNER = COURT.cornerZ;
       // Where arc meets corner, as a distance from the ring along the court.
-      const meet = Math.sqrt(R3 * R3 - CORNER * CORNER);
+      const meet = COURT.cornerBreak;
       const meetX = rimX - sign * meet;
       const half = Math.acos(meet / R3);
       arc(rimX, 0, R3, facing - half, 2 * half);
@@ -1930,9 +2053,9 @@ class Court {
         rect(cornerLen, W, (baseX + meetX) / 2, z);
 
       // Restricted area: 4ft from under the ring, closed off to the backboard.
-      arc(rimX, 0, 4, facing - Math.PI / 2, Math.PI);
+      arc(rimX, 0, COURT.restrictedRadius, facing - Math.PI / 2, Math.PI);
       const boardX = sign * 43;
-      for (const z of [-4, 4])
+      for (const z of [-COURT.restrictedRadius, COURT.restrictedRadius])
         rect(Math.abs(boardX - rimX), W, (boardX + rimX) / 2, z);
     }
 
@@ -2387,6 +2510,12 @@ class Ball {
   _resetState() {
     this.active = false;
     this.action = new Array(ACTION_DIM).fill(0);
+    // Where the shot was taken from, on the floor. Written by spawn() and read
+    // by the reward's distance term and by the shot chart, both of which want
+    // the launch spot itself rather than path[0] — the first position the
+    // simulation records, which is already a frame of flight downrange.
+    this.spawnX = 0;
+    this.spawnZ = 0;
     this.path = [];
     this.minDist = 100;
     this.scored = false;
@@ -2452,6 +2581,8 @@ class Ball {
     this.body.sleep();
 
     this._resetState();
+    this.spawnX = x;
+    this.spawnZ = z;
     this.active = true;
     this.syncMesh();
     this.field.setLive(this.id, true);
@@ -2650,12 +2781,35 @@ class VisionSystem {
   }
 
   // Fills both atlases with the stereo views of balls[start, end).
+  //
+  // The two eyes look along the *same* direction — the ball-to-hoop axis —
+  // rather than each turning in onto the rim.
+  //
+  // Both cameras used to lookAt(hoopPos), which verges them on the target. That
+  // puts the rim dead centre in both images at every distance, which is to say
+  // it gives the rim a stereo disparity of exactly zero from 2ft and from 45ft
+  // alike. The one object in the frame that is high-contrast, unoccluded,
+  // always visible and always the thing being aimed at is then the one object
+  // carrying no depth at all, and what is left of the stereo channel is the
+  // background's disparity *relative* to a rim whose distance is the unknown
+  // being solved for.
+  //
+  // Vergence is a depth cue for eyes because the angle between them is
+  // proprioceptively known. Here it is not in the state — the agent sees two
+  // images and nothing about how the cameras were aimed — so verging does not
+  // encode the distance, it subtracts it out.
+  //
+  // Parallel axes put it back where the textbook has it: the rim lands at
+  // +/- f * ipd / 2Z either side of centre, so the disparity across the pair is
+  // f * ipd / Z directly. At 96px and this ipd that is 17.2/Z pixels — 1.4px at
+  // the free-throw line, and still something to read at the arc.
   _renderPass(balls, start, end, hoopPos) {
     const { W, H, cols } = this;
     const half = CONFIG.ipd / 2;
     const dir = new THREE.Vector3();
     const rightVec = new THREE.Vector3();
     const offset = new THREE.Vector3();
+    const target = new THREE.Vector3();
 
     for (let i = start; i < end; i++) {
       const pos = balls[i].position;
@@ -2665,8 +2819,10 @@ class VisionSystem {
 
       this.camLeft.position.copy(pos).sub(offset);
       this.camRight.position.copy(pos).add(offset);
-      this.camLeft.lookAt(hoopPos);
-      this.camRight.lookAt(hoopPos);
+      // Aim each eye one unit down its own copy of the shared axis, which is
+      // what makes the axes parallel rather than convergent.
+      this.camLeft.lookAt(target.copy(this.camLeft.position).add(dir));
+      this.camRight.lookAt(target.copy(this.camRight.position).add(dir));
 
       const tile = i - start;
       const tileX = (tile % cols) * W;
@@ -2820,6 +2976,30 @@ class Dashboard {
     this.uiStatus = document.getElementById("status");
     this.uiBatch = document.getElementById("batch-progress");
 
+    // Shot chart. One row per SHOT_ZONES bucket, built once here rather than
+    // written into index.html, so adding a zone is a change in one place.
+    this.uiZones = new Map();
+    const chart = document.getElementById("shot-chart");
+    if (chart) {
+      for (const zone of SHOT_ZONES) {
+        const row = document.createElement("div");
+        row.className = "stat-row zone-row";
+        const name = document.createElement("span");
+        name.innerText = zone.label;
+        const rate = document.createElement("span");
+        rate.innerText = "--";
+        const bench = document.createElement("span");
+        bench.className = "zone-bench";
+        // The bar to clear, shown next to the number rather than left in the
+        // README: a make rate means nothing without the one it is chasing.
+        bench.innerText =
+          zone.elite == null ? "—" : `${Math.round(zone.elite * 100)}%`;
+        row.append(name, rate, bench);
+        chart.appendChild(row);
+        this.uiZones.set(zone.key, rate);
+      }
+    }
+
     this.lossHistory = [];
   }
 
@@ -2864,6 +3044,34 @@ class Dashboard {
     this.uiBaskets.innerText = baskets;
     this.uiEp.innerText = episodes;
     if (this.uiIllegal) this.uiIllegal.innerText = illegalEntries;
+  }
+
+  // rates: Map(zone key -> RollingRate). A zone reads "--" until it has enough
+  // shots to say anything: the spawn disc is area-uniform, so the restricted
+  // area fills its window slowly, and three makes out of four is not a 75%
+  // shooter.
+  setZones(rates) {
+    if (!this.uiZones.size) return;
+    for (const zone of SHOT_ZONES) {
+      const el = this.uiZones.get(zone.key);
+      const rate = rates.get(zone.key);
+      if (!el || !rate) continue;
+      if (rate.n < Dashboard.ZONE_MIN_SHOTS) {
+        el.innerText = "--";
+        el.style.color = "";
+        continue;
+      }
+      const value = rate.value;
+      el.innerText = Math.round(value * 100) + "%";
+      // Green once the zone is shooting at what the best in the league shoot
+      // from it, amber once it is past the league's own rate.
+      el.style.color =
+        zone.elite != null && value >= zone.elite
+          ? "#0f0"
+          : zone.league != null && value >= zone.league
+            ? "#ff0"
+            : "";
+    }
   }
 
   pushLoss(loss) {
@@ -3075,6 +3283,9 @@ class Dashboard {
 // O(n), and it ran once per ball per batch — fine while the window was one
 // batch long, quadratic in the window otherwise, and the window wants to be
 // several batches long to be readable at all.
+// Shots a zone needs before its rate is shown at all.
+Dashboard.ZONE_MIN_SHOTS = 40;
+
 class RollingRate {
   constructor(window) {
     this.buf = new Uint8Array(Math.max(1, window));
@@ -3161,6 +3372,19 @@ class TrainingArena {
         1,
         Math.round((CONFIG.accuracyWindow * this.evalBalls) / CONFIG.batchSize)
       )
+    );
+    // The shot chart: one rolling make rate per SHOT_ZONES bucket, over the
+    // greedy balls only.
+    //
+    // Greedy only because parity with a shooter is a claim about the policy,
+    // and the headline accuracy is the policy plus however wide it currently
+    // happens to be exploring. A shooter warming up does not add noise to
+    // every attempt on purpose.
+    //
+    // Each zone gets its own window rather than a shared one — see
+    // CONFIG.zoneWindow.
+    this.zoneHistory = new Map(
+      SHOT_ZONES.map((zone) => [zone.key, new RollingRate(CONFIG.zoneWindow)])
     );
     this.isTrainingStep = false;
     // Not a schedule any more — the mean spread the policy chose for the last
@@ -3260,17 +3484,13 @@ class TrainingArena {
   }
 
   _reward(b) {
-    let shotDistance = 0;
-    if (b.path.length > 0) {
-      const launchPos = b.path[0];
-      shotDistance = Math.sqrt(
-        Math.pow(launchPos.x - this.hoopPos.x, 2) +
-          Math.pow(launchPos.z - this.hoopPos.z, 2)
-      );
-    }
+    const shotDistance = Math.hypot(
+      b.spawnX - this.hoopPos.x,
+      b.spawnZ - this.hoopPos.z
+    );
     const R = CONFIG.reward;
     if (b.scored) {
-      const reward = R.score * (1.0 + shotDistance / R.scoreDistanceScale);
+      const reward = R.score + R.scoreDistanceBonus * shotDistance;
       return { reward, type: "score" };
     }
     const proximity = -b.minDist / R.missDistanceScale;
@@ -3316,7 +3536,12 @@ class TrainingArena {
       this.episodeStats.shots++;
       this.episodeStats.count++;
       this.accuracyHistory.push(b.scored);
-      if (b.isEval) this.evalHistory.push(b.scored);
+      if (b.isEval) {
+        this.evalHistory.push(b.scored);
+        this.zoneHistory
+          .get(shotZone(b.spawnX, b.spawnZ, this.hoopPos))
+          .push(b.scored);
+      }
     }
     // The states are already contiguous and in ball order in batchPixels, so
     // the agent takes the whole array by reference instead of rebuilding it.
@@ -3335,6 +3560,7 @@ class TrainingArena {
       episodes: this.episodeStats.count,
       illegalEntries: this.episodeStats.illegal
     });
+    this.dashboard.setZones(this.zoneHistory);
     this.dashboard.setBatchProgress("Training GPU...");
 
     try {
