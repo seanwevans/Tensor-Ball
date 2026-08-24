@@ -44,7 +44,11 @@ node search.mjs --stage screen --batches 14 --seeds 1 --concurrency 3
 
 `--set` takes dotted CONFIG paths (`--set reward.missDistanceScale=5`).
 `--batches` caps a run by batch count and `--minutes` by wall clock; pass both
-and whichever comes first ends the run. Finished trials are written out one at a
+and whichever comes first ends the run. `--timeout` is the separate limit on
+the whole trial, in minutes, after which it is abandoned — and an abandoned
+trial writes nothing, since the result JSON is produced once at the end. The
+45-minute default suits a run that has the machine to itself; raise it when
+running trials concurrently. Finished trials are written out one at a
 time, and re-running a stage skips the trials already on disk, so an interrupted
 stage picks up where it stopped.
 
