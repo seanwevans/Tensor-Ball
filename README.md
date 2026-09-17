@@ -43,7 +43,7 @@ terminal reward, so there's no temporal credit assignment.
   into the third row.
 - **Reward** — a made basket scores far and away the highest (bonused by shot
   distance), where "made" means the ball's centre crossed the rim's plane
-  descending and inside the hole — the hole minus the ball, 0.30ft
+  descending and inside the hole — the hole minus the ball, 0.35ft
   (`CONFIG.hoopEntry.scoreRadius`), not merely somewhere near the rim; near misses are shaped by how close the ball got to the rim, with
   small bonuses for hitting the rim or backboard. Direction through the hoop is
   what separates the top of the scale from the bottom: a ball that comes *up*

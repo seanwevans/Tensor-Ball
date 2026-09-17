@@ -93,7 +93,7 @@ export async function loadApp({ scriptPath = DEFAULT_SCRIPT, overlay = {} } = {}
   // 2. The constants that live inside classes.
   const ball = slice(src, "class Ball {", "  _resetState()", "Ball class");
   const hoop = slice(src, "  _buildHoop(isLeft) {", "  _boardMarkings(", "_buildHoop");
-  const ring = slice(src, "const rimBody = this._staticBody(", "this.physics.add(rimBody);", "rim body");
+  const ring = slice(src, "const RIM_SEGMENTS = ", "this.physics.add(rimBody);", "rim body");
   const sensor = slice(src, "const sensorBody = new CANNON.Body({", "if (!isLeft) this.scoringSensor", "scoring sensor");
   const step = slice(src, "class PhysicsWorld {", "  onBeginContact(", "PhysicsWorld");
   const update = slice(src, "  update() {", "  _reward(b)", "TrainingArena.update");
@@ -144,9 +144,9 @@ export async function loadApp({ scriptPath = DEFAULT_SCRIPT, overlay = {} } = {}
       x: rimX,
       y: CONFIG.rim.y,
       z: CONFIG.rim.z,
-      radius: num(ring, /Math\.cos\(a\) \* ([\d.]+),/, "rim ring radius"),
-      tube: num(ring, /new CANNON\.Sphere\(([\d.]+)\)/, "rim tube radius"),
-      segments: num(ring, /i < (\d+); i\+\+/, "rim segments")
+      radius: num(hoop, /const RIM_RING_RADIUS = ([\d.]+);/, "rim ring radius"),
+      tube: num(hoop, /const RIM_BAR_RADIUS = ([\d.]+);/, "rim bar radius"),
+      segments: num(ring, /const RIM_SEGMENTS = (\d+);/, "rim segments")
     },
     // The backboard slab. The face is the regulation plane; the depth is spent
     // backwards, away from the court.
