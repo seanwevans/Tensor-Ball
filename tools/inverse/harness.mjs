@@ -4,6 +4,7 @@ import { loadApp, applySet, DEFAULT_SCRIPT } from "./appconfig.mjs";
 import { makeStepper } from "./physics.mjs";
 import { makeClearance } from "./court.mjs";
 import { makeFlight } from "./flight.mjs";
+import { makeReverse } from "./reverse.mjs";
 import { makeCannonCourt } from "./cannoncheck.mjs";
 import { mulberry32, gauss } from "./rng.mjs";
 
@@ -32,6 +33,7 @@ export async function makeSolver({
   const P = makeStepper(app);
   const clearance = makeClearance(app);
   const flight = makeFlight(app, P, clearance);
+  const reverse = makeReverse(app, P, clearance, flight);
   const cannon = withCannon ? await makeCannonCourt(app) : null;
   if (withCannon && !cannon)
     throw new Error(
@@ -78,7 +80,7 @@ export async function makeSolver({
 
   const zoneOf = (spawn) => app.shotZone(spawn.x, spawn.z, app.CONFIG.rim);
 
-  return { app, P, clearance, flight, cannon, rand, sampleSpawn, eyeHeight, zoneOf };
+  return { app, P, clearance, flight, reverse, cannon, rand, sampleSpawn, eyeHeight, zoneOf };
 }
 
 // Shared argument shapes, so `--set`, `--seed` and `--script` mean the same

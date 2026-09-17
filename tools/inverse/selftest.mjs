@@ -10,7 +10,10 @@
 //      physics — bit for bit against cannon-es over a whole flight.
 //   3. The backward stepper is the forward stepper's exact inverse.
 //   4. The action mapping round-trips.
-//   5. Per-shot weather is refused rather than silently solved as if it were
+//   5. A reverse-pass solution, flown forward in cannon-es with the rings and
+//      boards in the world, goes in — cleanly, through the middle, having
+//      touched nothing.
+//   6. Per-shot weather is refused rather than silently solved as if it were
 //      not there.
 import { fileURLToPath } from "node:url";
 import { loadApp } from "./appconfig.mjs";
@@ -37,7 +40,7 @@ async function main() {
   // when it is there and skipped by name when it is not.
   const haveCannon = !!(await loadCannon());
   const S = await makeSolver({ seed: 11, withCannon: haveCannon });
-  const { app, P, rand } = S;
+  const { app, P, reverse, rand, cannon } = S;
   const rim = app.CONFIG.rim;
 
   process.stdout.write("\nconfig, read out of script.js\n");
@@ -158,6 +161,37 @@ async function main() {
       worst = Math.max(worst, back.spinResidual);
     }
     check("action -> velocity -> action", worst < 1e-12, `worst ${worst.toExponential(2)}`);
+  }
+
+  process.stdout.write("\nreverse pass: made position in, shot out\n");
+  {
+    let worstClosure = 0;
+    let n = 0;
+    let scored = 0;
+    let clean = 0;
+    let tries = 0;
+    while (n < 120 && tries < 6000) {
+      tries++;
+      const r = reverse.solve({ rand });
+      if (!r) continue;
+      n++;
+      worstClosure = Math.max(worstClosure, r.verified.closure);
+      if (cannon) {
+        const v = cannon.fly(r.action, r.spawn);
+        if (v.scored) scored++;
+        if (v.clean) clean++;
+      }
+    }
+    check("solutions were produced", n >= 100, `${n} of ${tries} made positions`);
+    check(
+      "the forward flight lands on the made position it came from",
+      worstClosure < 1e-10,
+      `worst ${worstClosure.toExponential(2)} ft`
+    );
+    if (cannon) {
+      check("cannon-es scores every one", scored === n, `${scored}/${n}`);
+      check("every one is a clean swish", clean === n, `${clean}/${n}`);
+    }
   }
 
   process.stdout.write("\nrefusals\n");
