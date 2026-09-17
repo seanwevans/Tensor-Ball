@@ -288,6 +288,91 @@ reproducible; the generator is the same mulberry32
 answer in cannon-es. `node solve.mjs --help` and `node ceiling.mjs --help` have
 the rest.
 
+## The same answer, three ways
+
+Three methods arrive at the shot, and they share no code and almost no method.
+That is the point: where they agree, the answer is not resting on any one of
+them being right.
+
+**Reverse stepping** (`reverse.mjs`) inverts the integrator step by step. Exact
+with the air on, and the only one of the three that is.
+
+**Forward root finding** (`target.mjs`) solves the boundary-value problem
+against the integrator. Also exact with the air on, but it is a search — a few
+dozen questions per answer.
+
+**Closed form** (`analytic.mjs`) does not ask the physics anything. Semi-implicit
+Euler at constant acceleration sums exactly,
+
+```
+v_{n+1} = v_n + g*dt                  v_n = v_0 + n*g*dt
+p_{n+1} = p_n + v_{n+1}*dt    =>      p_n = p_0 + (v_0 + g*dt/2)*t + (g/2)*t^2
+```
+
+so with the air off the app's trajectory is not *approximately* a parabola — it
+is one, with the launch velocity shifted by half a step of gravity. (That shift
+is 0.268ft/s, which is not a rounding error: it is two thirds of the whole side
+channel.) Every classical projectile formula then applies to this app verbatim,
+and the inverse is algebra:
+
+```
+vFwd^2 = g*D^2 / (2*drop + 2*D*tan(entry))          the shot, from the spot
+vUp~   = sqrt(w^2 + 2*g*drop)                       the shooter, from the basket
+half-window = scoreRadius / flightTime              the tolerance
+```
+
+No iteration anywhere. The middle line is the reverse pass with the stepping
+taken out: a ball dropping through the ring at a given speed and angle came from
+exactly one place, and finding it is conservation of energy and one square root.
+
+**With the air off, the closed form and the root find agree to 1.5e-3 ft/s**,
+and the closed-form answer drops through 1.1e-3 ft from the middle of a hole
+0.3ft across — which is the resolution the app's own crossing test has, since it
+interpolates along a chord where the algebra takes the arc.
+
+Two things fall out of having it.
+
+It is a check on the numerical solver that shares nothing with it. And the last
+line is a result the sweep could not have produced: the forward channel's
+tolerance is *exactly* `scoreRadius / flightTime`, so it is worse on a higher
+arc — the ball is in the air longer and a given speed error has longer to
+accumulate. Steep arcs win on the vertical channel and lose on this one, and
+that trade is what `target.mjs`'s canonical choice is resolving.
+
+With the air on, the gap between the two is no longer an error — it is a
+measurement. A shot that would drop through from 41ft in still air lands **9.5ft
+short** once drag and Magnus are on. That is what the air is worth, per
+distance, separable from everything else.
+
+## What the policy got wrong
+
+`diagnose.mjs`. The obvious cross-validation — compare the agent's action to the
+exact one — measures the wrong thing, because there are about 165 arcs from a
+mid-range spot that all go in and a policy aiming at a different one than this
+folder calls canonical is not making a mistake.
+
+The question worth asking holds the policy's own arc: it chose an up channel, a
+side channel and a spin, so fixing those, what forward speed would have dropped
+the ball through the middle, and how far off was it? One root find, and what
+comes back is a signed number in action units — the same units `CONFIG.policy`
+measures sigma in. Given a deliberately spoiled action it recovers the spoiling
+to 8e-17.
+
+It has three properties nothing already in the app has. It is **dense**:
+accuracy reads zero for the first several batches of a run and says nothing
+about whether anything is being learned, while this reads a real number on every
+shot from the first one. It is **signed**, so a policy shooting systematically
+long and one shooting systematically short stop looking alike. And it is
+**comparable to the spread**: next to the shot's own tolerance it says whether
+the mean action is a make at all, and next to Policy Sigma it says whether the
+misses are the mean being wrong or the exploration being wide — two completely
+different problems that the accuracy trace draws the same way.
+
+`blocked` names the cases where no forward speed would have helped, because the
+mistake was in another channel: `arc` if the launch was too flat to reach the
+ring from there at all, `side` if it was pushed wider than the hole, `range` if
+the ring is further than that launch angle can carry inside the envelope.
+
 ## What is checked, and by what
 
 Nothing here is trusted because the arithmetic looked right.
@@ -360,6 +445,8 @@ else still runs.
 | `flight.mjs` | a shot flown forward, graded by `TrainingArena.update`'s rules |
 | `reverse.mjs` | made position in, shot out |
 | `target.mjs` | spot on the floor in, exact action and tolerance out |
+| `analytic.mjs` | the same, in closed form, exact when the air is off |
+| `diagnose.mjs` | what the policy's own action got wrong, and by how much |
 | `cannoncheck.mjs` | the same shot re-flown in cannon-es, sharing no code |
 | `harness.mjs` | wiring, spawn sampling, argument shapes |
 | `rng.mjs` | the seeded generator `tools/hpsearch` uses, so runs reproduce |

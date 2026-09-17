@@ -18,7 +18,12 @@
 //      one-dimensional.
 //   7. The reported tolerance is the real edge of the make set: just inside it
 //      the shot drops, just outside it does not.
-//   8. Per-shot weather is refused rather than silently solved as if it were
+//   8. The closed-form solver in analytic.mjs — different method, no shared
+//      code — lands on the same shot as the numerical one when the air is off,
+//      which is the only condition under which both are exact.
+//   9. diagnose.mjs's reading of a deliberately spoiled action is the size and
+//      the sign of the spoiling.
+//  10. Per-shot weather is refused rather than silently solved as if it were
 //      not there.
 import { fileURLToPath } from "node:url";
 import { loadApp } from "./appconfig.mjs";
@@ -45,7 +50,7 @@ async function main() {
   // when it is there and skipped by name when it is not.
   const haveCannon = !!(await loadCannon());
   const S = await makeSolver({ seed: 11, withCannon: haveCannon });
-  const { app, P, flight, reverse, target, rand, cannon } = S;
+  const { app, P, flight, reverse, target, diagnose, rand, cannon } = S;
   const rim = app.CONFIG.rim;
 
   process.stdout.write("\nconfig, read out of script.js\n");
@@ -276,6 +281,92 @@ async function main() {
     }
     check("just inside the tolerance the shot still drops", insideOk);
     check("just outside it the shot does not", outsideOk);
+  }
+
+  process.stdout.write("\nclosed form vs. root finding, with the air off\n");
+  {
+    // Both are exact only in still air: analytic.mjs solves the parabola the
+    // integrator traces exactly when nothing else acts on the ball, and
+    // target.mjs solves the integrator itself. Agreeing here is two methods
+    // with nothing in common arriving at one answer.
+    const still = await makeSolver({ seed: 3, overlay: { air: { enabled: false } } });
+    const A = still.analytic;
+    let worstSpeed = 0;
+    let worstRadial = 0;
+    let n = 0;
+    for (const d of [5, 11, 18, 25, 33, 40])
+      for (const e of [45, 55, 68]) {
+        const shot = A.fromEntryAngle(d, app.CONFIG.spawnHeight.mean, e);
+        if (!shot || !shot.inEnvelope) continue;
+        const spawn = { x: rim.x - d, y: app.CONFIG.spawnHeight.mean, z: 0 };
+        const frame = launchFrame(spawn.x, spawn.z, rim);
+        const limit = still.target.reachLimit(spawn, frame, shot.vUp, 0);
+        if (limit === null) continue;
+        const numeric = still.target.solveRadial(
+          spawn, frame, shot.vUp, 0, 0, app.CONFIG.launch.fwdMin, limit
+        );
+        if (numeric === null) continue;
+        n++;
+        worstSpeed = Math.max(worstSpeed, Math.abs(shot.vFwd - numeric));
+        worstRadial = Math.max(
+          worstRadial,
+          Math.abs(still.target.shoot(spawn, frame, shot.vFwd, shot.vUp, 0, 0).radial)
+        );
+      }
+    check("both methods solved the same shots", n >= 12, `${n} shots`);
+    // The gap is the app's own crossing test interpolating along a chord where
+    // the closed form takes the arc, which is bounded by |a|*dt^2/2 and is a
+    // thousandth of the hole.
+    check(
+      "the closed form puts the ball through the middle",
+      worstRadial < 0.01,
+      `worst ${worstRadial.toExponential(2)} ft, hole ${app.CONFIG.hoopEntry.scoreRadius} ft`
+    );
+    check(
+      "and agrees with the root find on the launch",
+      worstSpeed < 0.01,
+      `worst ${worstSpeed.toExponential(2)} ft/s`
+    );
+    // scoreRadius / flightTime, straight out of the algebra.
+    const probe = A.fromEntryAngle(18, app.CONFIG.spawnHeight.mean, 55);
+    const spawn = { x: rim.x - 18, y: app.CONFIG.spawnHeight.mean, z: 0 };
+    const solved = still.target.solve(spawn, { upSteps: 40, spinValues: [0], refine: 1 });
+    check(
+      "the closed-form tolerance is a real tolerance",
+      Math.abs(probe.fwdTolerance) > 0 && Math.abs(probe.fwdTolerance) < 0.1,
+      `scoreRadius/flightTime = ${probe.fwdTolerance.toFixed(5)}, swept ${Math.min(
+        solved.tolerance.fwd.plus, solved.tolerance.fwd.minus).toFixed(5)}`
+    );
+  }
+
+  process.stdout.write("\ndiagnosing a spoiled action\n");
+  {
+    // Take an exact answer, push the forward channel by a known amount, and
+    // see whether the reading comes back as that amount with that sign.
+    const spawn = { x: rim.x - 21, y: app.CONFIG.spawnHeight.mean, z: -6 };
+    const exact = target.solve(spawn, { upSteps: 32, spinValues: [0] });
+    let worst = 0;
+    let signsRight = true;
+    for (const push of [-0.09, -0.03, 0.03, 0.09]) {
+      const spoiled = exact.action.slice();
+      spoiled[0] += push;
+      const d = diagnose.score(spawn, spoiled);
+      if (d.fwdError === null) {
+        signsRight = false;
+        continue;
+      }
+      if (Math.sign(d.fwdError) !== Math.sign(push)) signsRight = false;
+      worst = Math.max(worst, Math.abs(d.fwdError - push));
+    }
+    check("the sign says which way the shot was wrong", signsRight);
+    check(
+      "the size is the size of the mistake",
+      worst < 2e-3,
+      `worst ${worst.toExponential(2)} of action`
+    );
+    const clean = diagnose.score(spawn, exact.action);
+    check("an exact action reads as no mistake", Math.abs(clean.fwdError) < 2e-3 && clean.inMakeSet,
+      `${clean.fwdError.toExponential(2)}`);
   }
 
   process.stdout.write("\nrefusals\n");

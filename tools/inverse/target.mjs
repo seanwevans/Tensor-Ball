@@ -91,14 +91,18 @@ export function makeTarget(app, P, clearance, flight) {
   // shot leaves the world before it comes down; either way there is no crossing
   // to measure, and both are things only more forward speed can cause, so the
   // boundary is a single one.
-  function reachLimit(spawn, frame, vUp, spin) {
-    if (shoot(spawn, frame, L.fwdMax, vUp, 0, spin).crossed) return L.fwdMax;
-    if (!shoot(spawn, frame, L.fwdMin, vUp, 0, spin).crossed) return null;
+  //
+  // `vSide` is carried rather than assumed zero because this is also what
+  // diagnose.mjs asks about a policy's own action, which has a side channel of
+  // its own and is entitled to keep it.
+  function reachLimit(spawn, frame, vUp, spin, vSide = 0) {
+    if (shoot(spawn, frame, L.fwdMax, vUp, vSide, spin).crossed) return L.fwdMax;
+    if (!shoot(spawn, frame, L.fwdMin, vUp, vSide, spin).crossed) return null;
     let lo = L.fwdMin;
     let hi = L.fwdMax;
     for (let i = 0; i < 24; i++) {
       const mid = (lo + hi) / 2;
-      if (shoot(spawn, frame, mid, vUp, 0, spin).crossed) lo = mid;
+      if (shoot(spawn, frame, mid, vUp, vSide, spin).crossed) lo = mid;
       else hi = mid;
     }
     return lo;
@@ -112,8 +116,8 @@ export function makeTarget(app, P, clearance, flight) {
   // Illinois-modified false position: the residual is close to linear in vFwd —
   // its slope is roughly the flight time — so a secant step lands near the root
   // immediately, and the bracket keeps it honest when it does not.
-  function solveRadial(spawn, frame, vUp, spin, want, lo, hi, scan = 16) {
-    const f = (x) => shoot(spawn, frame, x, vUp, 0, spin).radial - want;
+  function solveRadial(spawn, frame, vUp, spin, want, lo, hi, scan = 16, vSide = 0) {
+    const f = (x) => shoot(spawn, frame, x, vUp, vSide, spin).radial - want;
     let a = lo;
     let fa = f(a);
     let b = hi;
