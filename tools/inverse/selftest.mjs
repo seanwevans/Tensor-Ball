@@ -13,12 +13,17 @@
 //   5. A reverse-pass solution, flown forward in cannon-es with the rings and
 //      boards in the world, goes in — cleanly, through the middle, having
 //      touched nothing.
-//   6. Per-shot weather is refused rather than silently solved as if it were
+//   6. A targeted solution does too, and its crossing is laterally dead centre
+//      to the last bit, which is the claim that lets the solve be
+//      one-dimensional.
+//   7. The reported tolerance is the real edge of the make set: just inside it
+//      the shot drops, just outside it does not.
+//   8. Per-shot weather is refused rather than silently solved as if it were
 //      not there.
 import { fileURLToPath } from "node:url";
 import { loadApp } from "./appconfig.mjs";
 import { state, copyState, roll, stepForward } from "./physics.mjs";
-import { actionToLaunch, launchToAction } from "./court.mjs";
+import { actionToLaunch, launchToAction, launchFrame } from "./court.mjs";
 import { makeSolver } from "./harness.mjs";
 import { loadCannon } from "./cannoncheck.mjs";
 
@@ -40,7 +45,7 @@ async function main() {
   // when it is there and skipped by name when it is not.
   const haveCannon = !!(await loadCannon());
   const S = await makeSolver({ seed: 11, withCannon: haveCannon });
-  const { app, P, reverse, rand, cannon } = S;
+  const { app, P, flight, reverse, target, rand, cannon } = S;
   const rim = app.CONFIG.rim;
 
   process.stdout.write("\nconfig, read out of script.js\n");
@@ -192,6 +197,85 @@ async function main() {
       check("cannon-es scores every one", scored === n, `${scored}/${n}`);
       check("every one is a clean swish", clean === n, `${clean}/${n}`);
     }
+  }
+
+  process.stdout.write("\ntargeted solve: spawn in, exact action out\n");
+  {
+    let worstLateral = 0;
+    let reachable = 0;
+    let scored = 0;
+    let clean = 0;
+    let inEnvelope = 0;
+    const spawns = [];
+    for (let d = 3; d <= 42; d += 4.875)
+      for (const side of [0, 0.6, -0.9])
+        spawns.push({
+          x: rim.x - d * Math.cos(side),
+          y: app.CONFIG.spawnHeight.mean,
+          z: rim.z + d * Math.sin(side)
+        });
+    const usable = spawns.filter(
+      (s) => s.x >= 0 && s.x <= app.GEOM.spawnBounds.maxX && Math.abs(s.z) <= app.GEOM.spawnBounds.maxAbsZ
+    );
+    for (const spawn of usable) {
+      const r = target.solve(spawn, { upSteps: 24, spinValues: [0, 1], refine: 3 });
+      if (!r.reachable) continue;
+      reachable++;
+      worstLateral = Math.max(worstLateral, Math.abs(r.lateral));
+      if (r.action.every((a) => Math.abs(a) <= 1)) inEnvelope++;
+      if (cannon) {
+        const v = cannon.fly(r.action, spawn);
+        if (v.scored) scored++;
+        if (v.clean) clean++;
+      }
+    }
+    check("every spawn on the court has a make", reachable === usable.length, `${reachable}/${usable.length}`);
+    check("the answer is inside the launch envelope", inEnvelope === reachable, `${inEnvelope}/${reachable}`);
+    check(
+      "side = 0 puts the crossing laterally dead centre",
+      worstLateral < 1e-12,
+      `worst ${worstLateral.toExponential(2)} ft`
+    );
+    if (cannon) {
+      check("cannon-es scores every one", scored === reachable, `${scored}/${reachable}`);
+      check("every one is a clean swish", clean === reachable, `${clean}/${reachable}`);
+    }
+  }
+
+  process.stdout.write("\nthe reported tolerance is the edge of the make set\n");
+  {
+    const spawn = { x: rim.x - 17, y: app.CONFIG.spawnHeight.mean, z: 4 };
+    const r = target.solve(spawn, { upSteps: 32, spinValues: [0] });
+    const frame = launchFrame(spawn.x, spawn.z, rim);
+    const fly = (action) => {
+      const v = actionToLaunch(action, spawn.x, spawn.z, rim, app.CONFIG.launch, frame);
+      const st = state(spawn.x, spawn.y, spawn.z, v.vx, v.vy, v.vz, v.wx, v.wy, v.wz);
+      const out = flight.simulate(st);
+      return out.scored && !out.contact;
+    };
+    let insideOk = true;
+    let outsideOk = true;
+    for (const [ch, side, sign] of [
+      [0, "plus", 1],
+      [0, "minus", -1],
+      [1, "plus", 1],
+      [1, "minus", -1],
+      [2, "plus", 1],
+      [2, "minus", -1]
+    ]) {
+      const t = r.tolerance[["fwd", "up", "side", "spin"][ch]][side];
+      if (!(t > 0)) continue;
+      const inside = r.action.slice();
+      inside[ch] += sign * t * 0.98;
+      const outside = r.action.slice();
+      outside[ch] += sign * t * 1.05;
+      if (!fly(inside)) insideOk = false;
+      // A channel whose tolerance runs into the envelope rather than into a
+      // miss has nothing outside it to test.
+      if (Math.abs(outside[ch]) <= 1 && fly(outside)) outsideOk = false;
+    }
+    check("just inside the tolerance the shot still drops", insideOk);
+    check("just outside it the shot does not", outsideOk);
   }
 
   process.stdout.write("\nrefusals\n");
