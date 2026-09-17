@@ -442,9 +442,15 @@ const CONFIG = {
   //
   // scoreRadius is how close to the rim's axis the ball's centre has to be, at
   // the moment it crosses the rim's plane going down, for the shot to have gone
-  // through the hoop. It is the hole minus the ball: the rim is a torus of
-  // radius 0.75 and tube 0.05, so the clear opening is 0.70, and a ball of
-  // radius 0.40 only fits while its centre is within 0.30 of the axis.
+  // through the hoop. It is the hole minus the ball, and it is not free to be
+  // chosen: Court._buildHoop builds the ring to the rulebook — 18in inside
+  // diameter of 5/8in steel, so a clear opening of 0.75 — and a ball of radius
+  // 0.40 only fits while its centre is within 0.35 of the axis.
+  //
+  // It was 0.30, from a ring whose clear opening was 0.70 rather than 0.75.
+  // Both moved together, because a scoring rule looser than the hole credits
+  // baskets the ball did not fit through and one tighter than the hole refuses
+  // baskets it did.
   //
   // Nothing enforced this before. Scoring was a contact against the scoring
   // sensor, and that sensor is a Cylinder(0.5) against a Sphere(0.4), so cannon
@@ -454,7 +460,7 @@ const CONFIG = {
   // their centre further than 0.30ft from the axis when they were credited, and
   // the median was 0.63ft: balls bouncing off the outside of the rim, each one
   // collecting +25 and the largest positive advantage in the batch.
-  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55, scoreRadius: 0.3 },
+  hoopEntry: { minAscentSpeed: 1.0, columnRadius: 0.55, scoreRadius: 0.35 },
   // Shots a zone's make rate averages over. Each zone keeps its own window, so
   // a rate is over the last N shots *from that zone* rather than the last N
   // shots overall — the spawn disc is area-uniform, so the restricted area
@@ -2254,8 +2260,25 @@ class Court {
       })
     );
 
+    // The ring, to the rulebook: 18in inside diameter, made of 5/8in steel.
+    // Stated as the inside radius and the bar's radius, because that is how the
+    // rule reads and because the number the ball has to fit through is the
+    // first of them — not the circle the tube's centre follows.
+    //
+    // This was a 0.75ft circle of 0.05ft tube, an inside radius of 0.70ft:
+    // 8.4in where the rulebook says 9in. Against a ball of 0.4ft that left
+    // 3.6in of clearance where a real rim leaves 4.3in, so the hoop the agent
+    // was shooting at was 19% tighter than the one the dashboard compares its
+    // accuracy against. Modelling the best action available to any policy, the
+    // achievable make rate at the policy's own sigma floor goes from 43.7% to
+    // 46.9% on the regulation ring — the shot did not get easier, it stopped
+    // being harder than the sport.
+    const RIM_INNER_RADIUS = 0.75;
+    const RIM_BAR_RADIUS = 0.0260417;
+    const RIM_RING_RADIUS = 0.7760417;
+
     const rim = new THREE.Mesh(
-      new THREE.TorusGeometry(0.75, 0.05, 16, 100),
+      new THREE.TorusGeometry(RIM_RING_RADIUS, RIM_BAR_RADIUS, 12, 100),
       this.assets.rim
     );
     rim.rotation.x = Math.PI / 2;
@@ -2263,7 +2286,7 @@ class Court {
     group.add(rim);
     if (!isLeft) this.rimMesh = rim;
 
-    group.add(this._buildNet(rimX));
+    group.add(this._buildNet(rimX, RIM_RING_RADIUS));
 
     const poleBody = this._staticBody(
       baseX + sign * 6,
@@ -2284,12 +2307,32 @@ class Court {
     this.physics.add(boardBody);
     if (!isLeft) this.backboardBody = boardBody;
 
+    // cannon has no torus, so the ring is a circle of spheres — and at sixteen
+    // of them it is not a ring, it is sixteen beads on a string. The scallop
+    // between beads is R*(1 - cos(pi/N)) deep, which at N=16 is 0.0144ft: five
+    // per cent of the ball's whole clearance, and it depends on where around
+    // the ring the ball comes through, so the same shot taken from two
+    // directions is measurably not the same shot. Sweeping the achievable
+    // tolerance around one period, that faceting is worth 5.5% of it.
+    //
+    // The depth falls as 1/N^2, so 48 puts it at 0.0016ft — round to within a
+    // sixtieth of an inch, and the tolerance ripple drops to 0.6%. It is also
+    // nearly free: the rim body's AABB is a foot and a half across, so the
+    // broadphase discards every ball not already at the hoop and only the
+    // handful that are pay for the extra shapes. Measured on shots aimed to
+    // rattle, 16 -> 48 costs 5%; across a batch where most balls are in open
+    // air it is far less.
+    const RIM_SEGMENTS = 48;
     const rimBody = this._staticBody(rimX, 10, 0, null);
-    for (let i = 0; i < 16; i++) {
-      const a = (i / 16) * Math.PI * 2;
+    for (let i = 0; i < RIM_SEGMENTS; i++) {
+      const a = (i / RIM_SEGMENTS) * Math.PI * 2;
       rimBody.addShape(
-        new CANNON.Sphere(0.05),
-        new CANNON.Vec3(Math.cos(a) * 0.75, 0, Math.sin(a) * 0.75)
+        new CANNON.Sphere(RIM_BAR_RADIUS),
+        new CANNON.Vec3(
+          Math.cos(a) * RIM_RING_RADIUS,
+          0,
+          Math.sin(a) * RIM_RING_RADIUS
+        )
       );
     }
     this.physics.add(rimBody);
@@ -2375,10 +2418,10 @@ class Court {
   // and, because it is a fixed real size, roughly how far away it is. One
   // draw call per hoop, unlit, so it costs the vision capture nothing but its
   // own pixels and stays the same white in both render modes.
-  _buildNet(rimX) {
+  _buildNet(rimX, ringRadius) {
     const STRANDS = 12;
     const ROWS = 4;
-    const TOP_R = 0.75; // hung off the ring, so the ring's own radius
+    const TOP_R = ringRadius; // hung off the ring, so the ring's own radius
     const BOTTOM_R = 0.45; // the taper every net has under its own weight
     const LENGTH = 1.25; // 15in, the short end of the legal range
 
