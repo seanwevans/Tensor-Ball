@@ -1,0 +1,9 @@
+{
+  "name": "tensor-ball-inverse",
+  "private": true,
+  "type": "module",
+  "description": "Exact inverse solver for Tensor Ball: the shot that would have made the basket, derived by running the physics backwards",
+  "dependencies": {
+    "cannon-es": "0.19.0"
+  }
+}
